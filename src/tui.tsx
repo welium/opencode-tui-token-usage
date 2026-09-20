@@ -8,31 +8,22 @@
 
 /** @jsxImportSource @opentui/solid */
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
-import type { SessionMessageInfo } from "@opencode/client"
 import { createSignal, onCleanup } from "solid-js"
 import {
-  aggregateRecordedMessages,
-  collectSessionTreeUsage,
+  emptySession,
   formatUsageSegments,
-  type MessageWithTelemetry,
+  sessionTreeUsage,
+  type FamilySessionUsage,
   type SessionTreeUsage,
   type UsageSegmentTone,
 } from "./core"
 
-/** Adapt a cached V2 session message to the structural telemetry shape. */
-function toTelemetry(message: SessionMessageInfo): MessageWithTelemetry {
-  if (message.type !== "assistant") return { id: message.id, type: message.type }
-  return { id: message.id, type: message.type, cost: message.cost, tokens: message.tokens }
-}
-
 function TokenFooter(props: { sessionID: string }) {
   const context = usePlugin()
 
-  const [tokenData, setTokenData] = createSignal<SessionTreeUsage>({
-    root: aggregateRecordedMessages([]),
-    tree: aggregateRecordedMessages([]),
-    sessionIDs: [props.sessionID],
-  })
+  const [tokenData, setTokenData] = createSignal<SessionTreeUsage>(
+    sessionTreeUsage(props.sessionID, [emptySession(props.sessionID)]),
+  )
   let refreshInProgress = false
   let hasSuccessfulRefresh = false
   let disposed = false
@@ -43,10 +34,12 @@ function TokenFooter(props: { sessionID: string }) {
 
     try {
       // The data API serves a local cache: sync the family into it first,
-      // otherwise message.list() reads empty and the footer sticks at zero.
-      const knownIDs = [...new Set([props.sessionID, ...context.data.session.family(props.sessionID)])]
+      // otherwise reads come back empty and the footer sticks at zero.
+      // Telemetry is session-level in V2 (messages carry no tokens/cost),
+      // so totals are summed from each member's SessionInfo.
+      const sessionIDs = [...new Set([props.sessionID, ...context.data.session.family(props.sessionID)])]
       await Promise.all(
-        knownIDs.map(async sessionID => {
+        sessionIDs.map(async sessionID => {
           try {
             await context.data.session.sync(sessionID)
           } catch {
@@ -55,13 +48,31 @@ function TokenFooter(props: { sessionID: string }) {
           await context.data.session.message.sync(sessionID)
         }),
       )
-      const usage = await collectSessionTreeUsage(
-        props.sessionID,
-        sessionID => Promise.resolve(context.data.session.family(sessionID).map(id => ({ id }))),
-        sessionID => context.data.session.message.list(sessionID).map(toTelemetry),
-      )
+      const family: FamilySessionUsage[] = sessionIDs.map(sessionID => {
+        const info = context.data.session.get(sessionID)
+        let cost = info?.cost ?? 0
+        try {
+          cost = context.data.session.cost(sessionID)
+        } catch {
+          // Keep the SessionInfo cost when the accessor is unavailable.
+        }
+        return {
+          id: sessionID,
+          tokens: {
+            input: info?.tokens.input ?? 0,
+            output: info?.tokens.output ?? 0,
+            reasoning: info?.tokens.reasoning ?? 0,
+            cacheRead: info?.tokens.cache.read ?? 0,
+            cacheWrite: info?.tokens.cache.write ?? 0,
+          },
+          cost,
+          requests: context.data.session.message
+            .list(sessionID)
+            .filter(message => message.type === "assistant").length,
+        }
+      })
       if (!disposed) {
-        setTokenData(usage)
+        setTokenData(sessionTreeUsage(props.sessionID, family))
         hasSuccessfulRefresh = true
       }
     } catch {

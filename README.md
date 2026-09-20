@@ -77,11 +77,10 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
 - Theme/renderer: `theme().primary / textMuted / text` became
   `theme.text.action.primary.base / theme.text.muted / theme.text.base`;
   width still comes from `renderer.width`.
-- Telemetry: V2 messages are a union discriminated by `type`
-  (`"assistant"` carries `cost` and `tokens`), so aggregation filters on
-  `type` instead of the V1 `role` field. `src/core.ts` uses local
-  structural types (no SDK import); `src/tui.tsx` adapts
-  `SessionMessageInfo` to them.
+- Telemetry: V2 moved token/cost telemetry from messages to the session
+  (`SessionInfo.tokens`/`cost`; messages carry neither), so totals are
+  summed per family member via `data.session.get`/`cost`, with the request
+  count still derived from each session's assistant message count.
 
 ## Development
 

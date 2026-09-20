@@ -5,29 +5,26 @@
  * `src/tui.tsx` (`./tui`) are package entries, so this file is never probed
  * as a plugin by OpenCode's flat-file discovery.
  *
- * V2 note: message telemetry is described with local structural types instead
- * of an SDK import. V2 session messages (`SessionMessageInfo`) are a union
- * discriminated by `type` (assistant messages carry `type: "assistant"`,
- * optional `cost`, and optional `tokens`), so the aggregation filters on
- * `type` rather than the V1 `role` field. Callers adapt client messages to
- * `MessageWithTelemetry` (see `src/tui.tsx`).
+ * V2 note: telemetry is session-level, not message-level. V2 session
+ * messages carry no `tokens`/`cost` fields, so per-message aggregation
+ * always yields zero. Totals are summed from each family member's
+ * `SessionInfo.tokens`/`cost` instead; only the request count still comes
+ * from the message list (assistant message count per session).
  */
 
-export type RecordedTokenTelemetry = {
-  input?: unknown
-  output?: unknown
-  reasoning?: unknown
-  cache?: {
-    read?: unknown
-    write?: unknown
-  }
+export type SessionTokenSnapshot = {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cacheRead: number
+  readonly cacheWrite: number
 }
 
-export type MessageWithTelemetry = {
-  id: string
-  type: string
-  cost?: unknown
-  tokens?: RecordedTokenTelemetry
+export type FamilySessionUsage = {
+  readonly id: string
+  readonly tokens: SessionTokenSnapshot
+  readonly cost: number
+  readonly requests: number
 }
 
 export type UsageTotals = {
@@ -44,10 +41,6 @@ export type SessionTreeUsage = {
   root: UsageTotals
   tree: UsageTotals
   sessionIDs: readonly string[]
-}
-
-export type SessionChild = {
-  id: string
 }
 
 export type UsageLayout = "primary" | "narrow"
@@ -178,64 +171,50 @@ const emptyUsage = (): UsageTotals => ({
   providerRequests: 0,
 })
 
+const emptyTokens = (): SessionTokenSnapshot => ({
+  input: 0,
+  output: 0,
+  reasoning: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+})
+
+export const emptySession = (id: string): FamilySessionUsage => ({
+  id,
+  tokens: emptyTokens(),
+  cost: 0,
+  requests: 0,
+})
+
 const numberOrZero = (value: unknown): number =>
   typeof value === "number" && Number.isFinite(value) ? value : 0
 
-const addMessage = (usage: UsageTotals, message: MessageWithTelemetry): void => {
-  const tokens = message.tokens
-  usage.input += numberOrZero(tokens?.input)
-  usage.output += numberOrZero(tokens?.output)
-  usage.reasoning += numberOrZero(tokens?.reasoning)
-  usage.cacheRead += numberOrZero(tokens?.cache?.read)
-  usage.cacheWrite += numberOrZero(tokens?.cache?.write)
-  usage.cost += numberOrZero(message.cost)
-  usage.providerRequests += 1
-}
-
-/** Aggregate only recorded assistant telemetry, deduplicated by message ID. */
-export function aggregateRecordedMessages(messages: ReadonlyArray<MessageWithTelemetry>): UsageTotals {
+/** Sum session-level telemetry across family members. */
+export function totalsFromFamily(sessions: ReadonlyArray<FamilySessionUsage>): UsageTotals {
   const usage = emptyUsage()
-  const messageIDs = new Set<string>()
 
-  for (const message of messages) {
-    if (message.type !== "assistant" || messageIDs.has(message.id)) continue
-    messageIDs.add(message.id)
-    addMessage(usage, message)
+  for (const session of sessions) {
+    usage.input += numberOrZero(session.tokens?.input)
+    usage.output += numberOrZero(session.tokens?.output)
+    usage.reasoning += numberOrZero(session.tokens?.reasoning)
+    usage.cacheRead += numberOrZero(session.tokens?.cacheRead)
+    usage.cacheWrite += numberOrZero(session.tokens?.cacheWrite)
+    usage.cost += numberOrZero(session.cost)
+    usage.providerRequests += numberOrZero(session.requests)
   }
 
   return usage
 }
 
-/** Discover and aggregate the root session and every reachable child session. */
-export async function collectSessionTreeUsage(
+/** Split family snapshots into root-only and whole-tree totals. */
+export function sessionTreeUsage(
   rootSessionID: string,
-  readChildren: (sessionID: string) => Promise<ReadonlyArray<SessionChild>>,
-  readMessages: (sessionID: string) => ReadonlyArray<MessageWithTelemetry>,
-): Promise<SessionTreeUsage> {
-  const sessionIDs: string[] = []
-  const discovered = new Set<string>()
-  const scheduled = new Set<string>([rootSessionID])
-  const pending = [rootSessionID]
-
-  while (pending.length > 0) {
-    const sessionID = pending.pop()
-    if (sessionID === undefined || discovered.has(sessionID)) continue
-
-    discovered.add(sessionID)
-    sessionIDs.push(sessionID)
-
-    for (const child of await readChildren(sessionID)) {
-      if (typeof child?.id === "string" && child.id.length > 0 && !scheduled.has(child.id)) {
-        scheduled.add(child.id)
-        pending.push(child.id)
-      }
-    }
-  }
-
-  const messagesBySession = sessionIDs.map(sessionID => readMessages(sessionID))
+  sessions: ReadonlyArray<FamilySessionUsage>,
+): SessionTreeUsage {
+  const root = sessions.find(session => session.id === rootSessionID)
   return {
-    root: aggregateRecordedMessages(messagesBySession[0] ?? []),
-    tree: aggregateRecordedMessages(messagesBySession.flat()),
-    sessionIDs,
+    root: totalsFromFamily(root === undefined ? [] : [root]),
+    tree: totalsFromFamily(sessions),
+    sessionIDs: sessions.map(session => session.id),
   }
 }
