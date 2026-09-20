@@ -8,10 +8,11 @@ longer load.
 The footer renders `MAIN` / `TOT` usage lines (input/out/cache/think/write,
 request and agent counts, cache hit-rate, cost) for the current session and
 its whole session family. Refreshes are event-driven (`session.usage.updated`,
-execution start/finish, session viewed/created, server connect — debounced).
-Tab switches are CLI-local state with no server event, so the router is
-polled with a cheap local read (1s) that only syncs on session change; a
-quiet-but-busy tree re-syncs after 5s without event traffic.
+execution start/finish, session viewed/created, server connect — debounced
+at 400ms). Tab switches emit no server event, so a reactive route watcher
+refreshes instantly when the host notifies, backed by a 1s router poll that
+syncs only on session change; a quiet-but-busy tree re-syncs after 5s
+without event traffic.
 
 Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 
@@ -21,7 +22,8 @@ Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 ./
   package.json   # exports "." (server) + "./tui" (CLI); @opencode/plugin dep
   src/index.ts   # minimal server entry (id "token-tracker", no behavior)
-  src/tui.tsx    # V2 CLI entry: sidebar.footer slot + TokenFooter
+  src/tui.tsx    # V2 CLI entry (id "token-tracker.tui"): event subscriptions,
+                 # refresh loop, and static sidebar.footer slot content
   src/core.ts    # usage aggregation / formatting (no plugin entrypoint)
 ```
 
@@ -30,37 +32,28 @@ is never probed as a plugin — this is what caused the old
 `Missing key at ["default"]` load failure when the helper lived directly
 under the global `plugins/` directory.
 
-## Install (consumer side)
+## Install
 
 ```sh
 opencode plugin add github:welium/opencode-tui-token-usage
 ```
 
-Replace the version with a tag or commit (`#vX.Y.Z`) once stable so
-`plugin update` does not move it silently.
+Pin a tag or commit (`github:welium/opencode-tui-token-usage#vX.Y.Z`) once
+stable so `plugin update` does not move it silently.
 
 A package in `opencode.json(c)` that exposes a `./tui` component is loaded
 automatically by the CLI, so no `cli.json` entry is needed. Use
 `cli.json` only if the footer must stay active against a remote server.
 
-## Retire the legacy files (consumer side, `~/.config/opencode`)
-
-1. In `opencode.jsonc`, rename `plugin` to `plugins` and keep the new
-   package entry; touch nothing else.
-2. Delete `plugins/session-usage.tsx` and `plugins/session-usage-core.ts`.
-3. Remove the stale `./plugins/session-usage.tsx` entry from `tui.jsonc`
-   (delete the file if it holds nothing else).
-
-Then verify:
+Verify after install or update (restart the TUI to load a new `./tui` entry):
 
 ```sh
-opencode plugin list          # token-tracker served from the GitHub package
-opencode service restart
-grep "failed to load plugin" ~/.local/share/opencode/log/opencode.log  # expect nothing
+opencode plugin list   # token-tracker served from the GitHub package
 ```
 
 Open the TUI on a session with subagents and confirm the `MAIN` / `TOT`
-lines, the narrow-layout fallback, and the 2-second refresh while busy.
+lines, the narrow-layout fallback on slim terminals, prompt updates while
+tokens stream, and instant refresh on tab switches.
 
 ## V1 -> V2 mapping notes
 
@@ -73,10 +66,7 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
   `context.data.session.message.list` / `context.data.session.status`,
   which returns `"idle"` / `"running"` (was `{ type: "busy" }`).
   The data API serves a local cache, so each refresh first calls
-  `session.sync` + `message.sync` for every known family member —
-  without that the footer reads empty and sticks at zero. Caveat: the
-  plugin-facing API exposes no full-history loader, so on very long
-  sessions totals cover the synced window rather than all history.
+  `session.sync` + `message.sync` for every known family member.
 - Theme/renderer: `theme().primary / textMuted / text` became
   `theme.text.action.primary.base / theme.text.muted / theme.text.base`;
   width still comes from `renderer.width`.
