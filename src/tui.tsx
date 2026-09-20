@@ -22,7 +22,7 @@ import {
 // TEMPORARY diagnostic tracing (removed before the real fix). One JSON line
 // per event so a stuck-at-zero footer can be attributed to a concrete cause.
 const DEBUG_LOG = "/tmp/opencode/tui-token-usage-debug.log"
-const DEBUG_BUILD = "diag1"
+const DEBUG_BUILD = "diag2"
 const debug = (event: string, entry: Record<string, unknown>): void => {
   try {
     appendFileSync(
@@ -154,12 +154,35 @@ function TokenFooter(props: { sessionID: string }) {
     clearInterval(timer)
   })
 
-  const usageLines = () => formatUsageSegments(tokenData(), context.renderer.width)
+  const usageLines = () => {
+    try {
+      const width = context.renderer.width
+      const lines = formatUsageSegments(tokenData(), width)
+      debug("render-lines", {
+        width,
+        tree: tokenData().tree,
+        texts: lines.map(line => line.map(segment => segment.text).join("")),
+      })
+      return lines
+    } catch (error) {
+      debug("render-lines-error", { error: String(error), tree: tokenData().tree })
+      throw error
+    }
+  }
 
   const segmentColor = (tone: UsageSegmentTone) => {
-    if (tone === "label") return context.theme.text.action.primary.base
-    if (tone === "metric" || tone === "separator") return context.theme.text.muted
-    return context.theme.text.base
+    try {
+      if (tone === "label") return context.theme.text.action.primary.base
+      if (tone === "metric" || tone === "separator") return context.theme.text.muted
+      return context.theme.text.base
+    } catch (error) {
+      debug("render-color-error", { tone, error: String(error) })
+      try {
+        return context.theme.text.base
+      } catch {
+        return undefined
+      }
+    }
   }
 
   return (
