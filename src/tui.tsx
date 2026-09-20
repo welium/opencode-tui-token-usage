@@ -3,13 +3,16 @@
  *
  * Displays recorded token usage for the current session and all descendants.
  *
- * Updates every 2 seconds while a session in the tree is running.
+ * State lives at setup scope (never inside the slot render): the footer
+ * render is a pure reader of the latest snapshot, refreshed on a setup-owned
+ * 2s timer while the tree is running. Per-render signals/timers miss updates
+ * when the host disposes render roots, freezing the footer at zeros.
  */
 
 /** @jsxImportSource @opentui/solid */
 import { appendFileSync } from "node:fs"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
-import { createSignal, onCleanup } from "solid-js"
+import { createEffect, createSignal, Show } from "solid-js"
 import {
   emptySession,
   formatUsageSegments,
@@ -19,10 +22,9 @@ import {
   type UsageSegmentTone,
 } from "./core"
 
-// TEMPORARY diagnostic tracing (removed before the real fix). One JSON line
-// per event so a stuck-at-zero footer can be attributed to a concrete cause.
+// TEMPORARY diagnostic tracing (removed before the final cleanup).
 const DEBUG_LOG = "/tmp/opencode/tui-token-usage-debug.log"
-const DEBUG_BUILD = "diag2"
+const DEBUG_BUILD = "diag3"
 const debug = (event: string, entry: Record<string, unknown>): void => {
   try {
     appendFileSync(
@@ -34,138 +36,42 @@ const debug = (event: string, entry: Record<string, unknown>): void => {
   }
 }
 
-function TokenFooter(props: { sessionID: string }) {
+type Snapshot = {
+  readonly sessionID: string
+  readonly usage: SessionTreeUsage
+}
+
+function TokenFooter(props: {
+  sessionID: string
+  snapshot: () => Snapshot | undefined
+  ensure: (sessionID: string) => void
+}) {
   const context = usePlugin()
 
-  const [tokenData, setTokenData] = createSignal<SessionTreeUsage>(
-    sessionTreeUsage(props.sessionID, [emptySession(props.sessionID)]),
-  )
-  let refreshInProgress = false
-  let hasSuccessfulRefresh = false
-  let disposed = false
-
-  const refresh = async (): Promise<void> => {
-    if (refreshInProgress || disposed) return
-    refreshInProgress = true
-
-    try {
-      // The data API serves a local cache: sync the family into it first,
-      // otherwise reads come back empty and the footer sticks at zero.
-      // Telemetry is session-level in V2 (messages carry no tokens/cost),
-      // so totals are summed from each member's SessionInfo.
-      let familyIDs: string[]
-      try {
-        familyIDs = context.data.session.family(props.sessionID)
-        debug("family", { sessionID: props.sessionID, familyIDs })
-      } catch (error) {
-        debug("family-error", { sessionID: props.sessionID, error: String(error) })
-        throw error
-      }
-      const sessionIDs = [...new Set([props.sessionID, ...familyIDs])]
-      const syncResults = await Promise.all(
-        sessionIDs.map(async sessionID => {
-          let sessionSync = "ok"
-          try {
-            await context.data.session.sync(sessionID)
-          } catch (error) {
-            sessionSync = String(error)
-          }
-          let messageSync = "ok"
-          try {
-            await context.data.session.message.sync(sessionID)
-          } catch (error) {
-            messageSync = String(error)
-          }
-          return { sessionID, sessionSync, messageSync }
-        }),
-      )
-      debug("sync", { sessionID: props.sessionID, syncResults })
-      const family: FamilySessionUsage[] = sessionIDs.map(sessionID => {
-        const info = context.data.session.get(sessionID)
-        let cost = info?.cost ?? 0
-        let costSource = "info"
-        try {
-          cost = context.data.session.cost(sessionID)
-          costSource = "accessor"
-        } catch (error) {
-          debug("cost-error", { sessionID, error: String(error) })
-        }
-        let listLength = -1
-        let assistantCount = -1
-        try {
-          const messages = context.data.session.message.list(sessionID)
-          listLength = messages.length
-          assistantCount = messages.filter(message => message.type === "assistant").length
-        } catch (error) {
-          debug("list-error", { sessionID, error: String(error) })
-        }
-        debug("member", {
-          sessionID,
-          hasInfo: info !== undefined,
-          tokens: info?.tokens,
-          infoCost: info?.cost,
-          cost,
-          costSource,
-          listLength,
-          assistantCount,
-        })
-        return {
-          id: sessionID,
-          tokens: {
-            input: info?.tokens.input ?? 0,
-            output: info?.tokens.output ?? 0,
-            reasoning: info?.tokens.reasoning ?? 0,
-            cacheRead: info?.tokens.cache.read ?? 0,
-            cacheWrite: info?.tokens.cache.write ?? 0,
-          },
-          cost,
-          requests: assistantCount < 0 ? 0 : assistantCount,
-        }
-      })
-      const usage = sessionTreeUsage(props.sessionID, family)
-      debug("totals", { sessionID: props.sessionID, root: usage.root, tree: usage.tree })
-      if (!disposed) {
-        setTokenData(usage)
-        hasSuccessfulRefresh = true
-      }
-    } catch (error) {
-      debug("refresh-error", { sessionID: props.sessionID, error: String(error) })
-      // Keep the last successful snapshot when the cached session data is transiently unavailable.
-    } finally {
-      refreshInProgress = false
-    }
+  const data = (): SessionTreeUsage | undefined => {
+    const snap = props.snapshot()
+    return snap !== undefined && snap.sessionID === props.sessionID ? snap.usage : undefined
   }
 
-  const treeIsBusy = (): boolean => {
-    try {
-      return tokenData().sessionIDs.some(sessionID => context.data.session.status(sessionID) === "running")
-    } catch (error) {
-      debug("status-error", { error: String(error) })
-      return true
-    }
-  }
-
-  void refresh()
-  const timer = setInterval(() => {
-    if (!hasSuccessfulRefresh || treeIsBusy()) void refresh()
-  }, 2000)
-  onCleanup(() => {
-    disposed = true
-    clearInterval(timer)
+  createEffect(() => {
+    if (data() === undefined) props.ensure(props.sessionID)
   })
 
   const usageLines = () => {
+    const usage = data()
+    if (usage === undefined) return []
     try {
       const width = context.renderer.width
-      const lines = formatUsageSegments(tokenData(), width)
+      const lines = formatUsageSegments(usage, width)
       debug("render-lines", {
+        sessionID: props.sessionID,
         width,
-        tree: tokenData().tree,
+        tree: usage.tree,
         texts: lines.map(line => line.map(segment => segment.text).join("")),
       })
       return lines
     } catch (error) {
-      debug("render-lines-error", { error: String(error), tree: tokenData().tree })
+      debug("render-lines-error", { sessionID: props.sessionID, error: String(error) })
       throw error
     }
   }
@@ -176,7 +82,7 @@ function TokenFooter(props: { sessionID: string }) {
       if (tone === "metric" || tone === "separator") return context.theme.text.muted
       return context.theme.text.base
     } catch (error) {
-      debug("render-color-error", { tone, error: String(error) })
+      debug("render-color-error", { sessionID: props.sessionID, tone, error: String(error) })
       try {
         return context.theme.text.base
       } catch {
@@ -186,15 +92,24 @@ function TokenFooter(props: { sessionID: string }) {
   }
 
   return (
-    <box>
-      {usageLines().map(line => (
+    <Show
+      when={data()}
+      fallback={
         <text>
-          {line.map(segment => (
-            <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
-          ))}
+          <span>…</span>
         </text>
-      ))}
-    </box>
+      }
+    >
+      <box>
+        {usageLines().map(line => (
+          <text>
+            {line.map(segment => (
+              <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
+            ))}
+          </text>
+        ))}
+      </box>
+    </Show>
   )
 }
 
@@ -202,11 +117,117 @@ export default Plugin.define({
   id: "token-tracker.tui",
   setup(context) {
     debug("setup", { options: context.options })
+    const [snapshot, setSnapshot] = createSignal<Snapshot | undefined>(undefined)
+    const inFlight = new Set<string>()
+    let disposed = false
+
+    const currentSessionID = (): string | undefined => {
+      try {
+        const route = context.ui.router.current()
+        return route.type === "session" ? route.sessionID : undefined
+      } catch (error) {
+        debug("router-error", { error: String(error) })
+        return undefined
+      }
+    }
+
+    const treeIsBusy = (usage: SessionTreeUsage): boolean => {
+      try {
+        return usage.sessionIDs.some(sessionID => context.data.session.status(sessionID) === "running")
+      } catch (error) {
+        debug("status-error", { error: String(error) })
+        return true
+      }
+    }
+
+    const refresh = async (sessionID: string): Promise<void> => {
+      if (disposed || inFlight.has(sessionID)) return
+      inFlight.add(sessionID)
+      try {
+        const familyIDs = context.data.session.family(sessionID)
+        const sessionIDs = [...new Set([sessionID, ...familyIDs])]
+        await Promise.all(
+          sessionIDs.map(async memberID => {
+            let sessionSync = "ok"
+            try {
+              await context.data.session.sync(memberID)
+            } catch (error) {
+              sessionSync = String(error)
+            }
+            let messageSync = "ok"
+            try {
+              await context.data.session.message.sync(memberID)
+            } catch (error) {
+              messageSync = String(error)
+            }
+            return { memberID, sessionSync, messageSync }
+          }),
+        )
+        const family: FamilySessionUsage[] = sessionIDs.map(memberID => {
+          const info = context.data.session.get(memberID)
+          let cost = info?.cost ?? 0
+          try {
+            cost = context.data.session.cost(memberID)
+          } catch {
+            // Keep the SessionInfo cost when the accessor is unavailable.
+          }
+          let assistantCount = 0
+          try {
+            assistantCount = context.data.session.message
+              .list(memberID)
+              .filter(message => message.type === "assistant").length
+          } catch (error) {
+            debug("list-error", { sessionID: memberID, error: String(error) })
+          }
+          return {
+            id: memberID,
+            tokens: {
+              input: info?.tokens.input ?? 0,
+              output: info?.tokens.output ?? 0,
+              reasoning: info?.tokens.reasoning ?? 0,
+              cacheRead: info?.tokens.cache.read ?? 0,
+              cacheWrite: info?.tokens.cache.write ?? 0,
+            },
+            cost,
+            requests: assistantCount,
+          }
+        })
+        const usage = sessionTreeUsage(sessionID, family)
+        debug("totals", { sessionID, root: usage.root, tree: usage.tree })
+        if (!disposed) setSnapshot({ sessionID, usage })
+      } catch (error) {
+        debug("refresh-error", { sessionID, error: String(error) })
+      } finally {
+        inFlight.delete(sessionID)
+      }
+    }
+
+    const ensure = (sessionID: string): void => {
+      if (snapshot()?.sessionID !== sessionID) {
+        debug("ensure", { sessionID })
+        void refresh(sessionID)
+      }
+    }
+
+    const tick = (): void => {
+      const sessionID = currentSessionID()
+      if (sessionID === undefined || disposed) return
+      const snap = snapshot()
+      if (snap?.sessionID !== sessionID || treeIsBusy(snap.usage)) void refresh(sessionID)
+    }
+
+    void tick()
+    const timer = setInterval(tick, 2000)
+
     const disposeSlot = context.ui.slot({
       append: "sidebar.footer",
-      render: ({ sessionID }) => <TokenFooter sessionID={sessionID} />,
+      render: ({ sessionID }) => (
+        <TokenFooter sessionID={sessionID} snapshot={snapshot} ensure={ensure} />
+      ),
     })
     return () => {
+      disposed = true
+      clearInterval(timer)
       disposeSlot()
     }
   },
