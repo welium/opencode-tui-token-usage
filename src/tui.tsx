@@ -42,6 +42,19 @@ function TokenFooter(props: { sessionID: string }) {
     refreshInProgress = true
 
     try {
+      // The data API serves a local cache: sync the family into it first,
+      // otherwise message.list() reads empty and the footer sticks at zero.
+      const knownIDs = [...new Set([props.sessionID, ...context.data.session.family(props.sessionID)])]
+      await Promise.all(
+        knownIDs.map(async sessionID => {
+          try {
+            await context.data.session.sync(sessionID)
+          } catch {
+            // Fall through to message sync; the outer catch keeps the last snapshot.
+          }
+          await context.data.session.message.sync(sessionID)
+        }),
+      )
       const usage = await collectSessionTreeUsage(
         props.sessionID,
         sessionID => Promise.resolve(context.data.session.family(sessionID).map(id => ({ id }))),

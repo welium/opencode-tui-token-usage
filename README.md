@@ -69,6 +69,11 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
 - Messages/status: `state.session.messages/status` became
   `context.data.session.message.list` / `context.data.session.status`,
   which returns `"idle"` / `"running"` (was `{ type: "busy" }`).
+  The data API serves a local cache, so each refresh first calls
+  `session.sync` + `message.sync` for every known family member —
+  without that the footer reads empty and sticks at zero. Caveat: the
+  plugin-facing API exposes no full-history loader, so on very long
+  sessions totals cover the synced window rather than all history.
 - Theme/renderer: `theme().primary / textMuted / text` became
   `theme.text.action.primary.base / theme.text.muted / theme.text.base`;
   width still comes from `renderer.width`.
