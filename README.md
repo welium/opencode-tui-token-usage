@@ -8,8 +8,10 @@ longer load.
 The footer renders `MAIN` / `TOT` usage lines (input/out/cache/think/write,
 request and agent counts, cache hit-rate, cost) for the current session and
 its whole session family. Refreshes are event-driven (`session.usage.updated`,
-execution start/finish, session viewed/created, server connect — debounced)
-with a 60s fallback poll purely as a safety net for missed events.
+execution start/finish, session viewed/created, server connect — debounced).
+Tab switches are CLI-local state with no server event, so the router is
+polled with a cheap local read (1s) that only syncs on session change; a
+quiet-but-busy tree re-syncs after 5s without event traffic.
 
 Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 
@@ -83,9 +85,11 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
   summed per family member via `data.session.get`/`cost`, with the request
   count still derived from each session's assistant message count.
 - Updates: refreshes trigger on `session.usage.updated`, execution
-  start/finish, `session.viewed`/`created` (covers tab switches and first
-  paint), and `server.connected` (debounced); a 60s poll remains purely as
-  a safety net for missed events.
+  start/finish, `session.viewed`/`created` (refreshing the event's session
+  directly, since the router may lag the event), and `server.connected`
+  (debounced). Tab switches emit no server event, so a 1s router poll
+  covers them with a local read that syncs only on change; a quiet-but-busy
+  tree re-syncs after 5s.
 - Rendering: the slot claim is re-registered per changed snapshot with
   fully static content. Signal updates were observed never to propagate
   into slot JSX from an installed package (while fresh mounts render

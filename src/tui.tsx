@@ -25,7 +25,8 @@ import {
 } from "./core"
 
 const DEBOUNCE_MS = 400
-const FALLBACK_POLL_MS = 60_000
+const ROUTER_POLL_MS = 1_000
+const QUIET_REFRESH_MS = 5_000
 
 export default Plugin.define({
   id: "token-tracker.tui",
@@ -38,6 +39,7 @@ export default Plugin.define({
     let lastSessionID: string | undefined
     let lastUsage: SessionTreeUsage | undefined
     let lastKey = ""
+    let lastRefreshAt = 0
     const unsubscribers: (() => void)[] = []
 
     const segmentColor = (tone: UsageSegmentTone) => {
@@ -89,6 +91,7 @@ export default Plugin.define({
     const refresh = async (sessionID: string): Promise<void> => {
       if (disposed || inFlight.has(sessionID)) return
       inFlight.add(sessionID)
+      lastRefreshAt = Date.now()
       try {
         const familyIDs = context.data.session.family(sessionID)
         const sessionIDs = [...new Set([sessionID, ...familyIDs])]
@@ -191,17 +194,26 @@ export default Plugin.define({
       context.data.on("session.execution.succeeded", event => onFamilyEvent(event.data.sessionID)),
       context.data.on("session.execution.failed", event => onFamilyEvent(event.data.sessionID)),
       context.data.on("session.execution.interrupted", event => onFamilyEvent(event.data.sessionID)),
-      // Session open/switch and fresh server connections: instant first paint.
-      context.data.on("session.viewed", event => onFamilyEvent(event.data.sessionID)),
-      context.data.on("session.created", event => onFamilyEvent(event.data.sessionID)),
+      // Opened or viewed sessions refresh directly: at event time the
+      // router may not have caught up yet, so bypass the current-session gate.
+      // (Publish still drops the result if another session is current then.)
+      context.data.on("session.viewed", event => scheduleRefresh(event.data.sessionID)),
+      context.data.on("session.created", event => scheduleRefresh(event.data.sessionID)),
       context.data.on("server.connected", () => tick()),
     )
 
+    // Tab switches are CLI-local state: the server emits nothing for them,
+    // so the router is polled with a cheap local read. Syncs happen only on
+    // session change, event triggers, or a quiet-but-busy tree.
     const tick = (): void => {
       if (disposed) return
       const sessionID = currentSessionID()
       if (sessionID === undefined) return
-      if (sessionID !== lastSessionID || lastUsage === undefined || treeIsBusy(lastUsage)) {
+      if (sessionID !== lastSessionID || lastUsage === undefined) {
+        scheduleRefresh(sessionID)
+        return
+      }
+      if (treeIsBusy(lastUsage) && Date.now() - lastRefreshAt > QUIET_REFRESH_MS) {
         scheduleRefresh(sessionID)
       }
     }
@@ -210,7 +222,7 @@ export default Plugin.define({
     const placeholder: UsageLine = [{ text: "…", tone: "metric" }]
     publish([placeholder])
     tick()
-    const timer = setInterval(tick, FALLBACK_POLL_MS)
+    const timer = setInterval(tick, ROUTER_POLL_MS)
 
     return () => {
       disposed = true
