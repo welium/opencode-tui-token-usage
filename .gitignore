@@ -1,0 +1,10 @@
+# Build output / deps
+node_modules/
+dist/
+*.tsbuildinfo
+
+# OpenCode / crash artefacts
+core
+
+# Execution plan for this migration (deliberately untracked — see README)
+convert-session-usage-v1-to-v2.md

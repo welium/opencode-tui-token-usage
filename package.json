@@ -1,0 +1,24 @@
+{
+  "name": "opencode-tui-token-usage",
+  "version": "0.1.0",
+  "description": "Sidebar token-usage footer for OpenCode (native V2 CLI plugin)",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.11"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opencode/client": "^2.0.11",
+    "@opencode/theme": "^2.0.11",
+    "typescript": "^5.9.3"
+  }
+}
