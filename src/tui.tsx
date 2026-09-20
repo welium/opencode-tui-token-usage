@@ -14,7 +14,8 @@
  */
 
 /** @jsxImportSource @opentui/solid */
-import { Plugin, usePlugin } from "@opencode/plugin/tui"
+import { Plugin } from "@opencode/plugin/tui"
+import { createEffect, createRoot } from "solid-js"
 import {
   formatUsageSegments,
   sessionTreeUsage,
@@ -218,6 +219,19 @@ export default Plugin.define({
       }
     }
 
+    // Route watcher: tab switches are CLI-local (no server event), but the
+    // router is a reactive source. When it notifies, refresh instantly
+    // instead of waiting for the poll below. If the router is not reactive
+    // in this host, the effect simply runs once and the poll covers switches.
+    const disposeRouteWatcher = createRoot(dispose => {
+      createEffect(() => {
+        if (disposed) return
+        const route = context.ui.router.current()
+        if (route.type === "session") scheduleRefresh(route.sessionID)
+      })
+      return dispose
+    })
+
     // Placeholder until the first snapshot lands.
     const placeholder: UsageLine = [{ text: "…", tone: "metric" }]
     publish([placeholder])
@@ -227,6 +241,7 @@ export default Plugin.define({
     return () => {
       disposed = true
       clearInterval(timer)
+      disposeRouteWatcher()
       if (debounceTimer !== undefined) clearTimeout(debounceTimer)
       for (const unsubscribe of unsubscribers) {
         try {

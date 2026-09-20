@@ -87,9 +87,9 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
 - Updates: refreshes trigger on `session.usage.updated`, execution
   start/finish, `session.viewed`/`created` (refreshing the event's session
   directly, since the router may lag the event), and `server.connected`
-  (debounced). Tab switches emit no server event, so a 1s router poll
-  covers them with a local read that syncs only on change; a quiet-but-busy
-  tree re-syncs after 5s.
+  (debounced). Tab switches emit no server event, so a reactive route
+  watcher refreshes instantly when the host notifies, backed by a 1s router
+  poll that syncs only on change; a quiet-but-busy tree re-syncs after 5s.
 - Rendering: the slot claim is re-registered per changed snapshot with
   fully static content. Signal updates were observed never to propagate
   into slot JSX from an installed package (while fresh mounts render
