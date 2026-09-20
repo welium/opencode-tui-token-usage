@@ -3,16 +3,17 @@
  *
  * Displays recorded token usage for the current session and all descendants.
  *
- * Update model: re-register the slot claim per refresh with fully static
- * content. Signal updates do not propagate into slot JSX from an installed
- * package (proven over diag1-diag4: 126 computed snapshots, zero
- * re-renders), while fresh mounts render reliably. Data (not components)
- * is therefore swapped by dispose + re-register; the render itself closes
- * over plain values and uses no signals, effects, or conditional helpers.
+ * Update model: refreshes are driven by server events
+ * (`session.usage.updated`, execution start/finish) with a debounced
+ * re-sync, plus a slow fallback poll for session switches and missed
+ * events. Each refresh with changed totals re-registers the slot claim
+ * with fully static content: the render closes over plain values and uses
+ * no signals, effects, or conditional helpers, because signal updates do
+ * not propagate into slot JSX from an installed package while fresh
+ * mounts render reliably.
  */
 
 /** @jsxImportSource @opentui/solid */
-import { appendFileSync } from "node:fs"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import {
   formatUsageSegments,
@@ -23,28 +24,21 @@ import {
   type UsageSegmentTone,
 } from "./core"
 
-// TEMPORARY diagnostic tracing (removed once numbers are confirmed live).
-const DEBUG_LOG = "/tmp/opencode/tui-token-usage-debug.log"
-const DEBUG_BUILD = "diag5"
-const debug = (event: string, entry: Record<string, unknown>): void => {
-  try {
-    appendFileSync(
-      DEBUG_LOG,
-      JSON.stringify({ build: DEBUG_BUILD, t: new Date().toISOString(), event, ...entry }) + "\n",
-    )
-  } catch {
-    // Logging must never break the footer.
-  }
-}
+const DEBOUNCE_MS = 400
+const FALLBACK_POLL_MS = 15_000
 
 export default Plugin.define({
   id: "token-tracker.tui",
   setup(context) {
-    debug("setup", { options: context.options })
     let disposeSlot: (() => void) | undefined
     let disposed = false
     const inFlight = new Set<string>()
+    const queued = new Set<string>()
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined
+    let lastSessionID: string | undefined
+    let lastUsage: SessionTreeUsage | undefined
     let lastKey = ""
+    const unsubscribers: (() => void)[] = []
 
     const segmentColor = (tone: UsageSegmentTone) => {
       if (tone === "label") return context.theme.text.action.primary.base
@@ -56,37 +50,30 @@ export default Plugin.define({
       if (disposed) return
       try {
         disposeSlot?.()
-      } catch (error) {
-        debug("dispose-error", { error: String(error) })
+      } catch {
+        // Best effort: a stale claim is replaced below regardless.
       }
-      try {
-        disposeSlot = context.ui.slot({
-          append: "sidebar.footer",
-          render: () => (
-            <box>
-              {lines.map(line => (
-                <text>
-                  {line.map(segment => (
-                    <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
-                  ))}
-                </text>
-              ))}
-            </box>
-          ),
-        })
-        debug("publish", { lines: lines.map(line => line.map(segment => segment.text).join("")) })
-      } catch (error) {
-        debug("publish-error", { error: String(error) })
-        disposeSlot = undefined
-      }
+      disposeSlot = context.ui.slot({
+        append: "sidebar.footer",
+        render: () => (
+          <box>
+            {lines.map(line => (
+              <text>
+                {line.map(segment => (
+                  <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
+                ))}
+              </text>
+            ))}
+          </box>
+        ),
+      })
     }
 
     const currentSessionID = (): string | undefined => {
       try {
         const route = context.ui.router.current()
         return route.type === "session" ? route.sessionID : undefined
-      } catch (error) {
-        debug("router-error", { error: String(error) })
+      } catch {
         return undefined
       }
     }
@@ -94,8 +81,7 @@ export default Plugin.define({
     const treeIsBusy = (usage: SessionTreeUsage): boolean => {
       try {
         return usage.sessionIDs.some(sessionID => context.data.session.status(sessionID) === "running")
-      } catch (error) {
-        debug("status-error", { error: String(error) })
+      } catch {
         return true
       }
     }
@@ -115,8 +101,8 @@ export default Plugin.define({
             }
             try {
               await context.data.session.message.sync(memberID)
-            } catch (error) {
-              debug("message-sync-error", { sessionID: memberID, error: String(error) })
+            } catch {
+              // Request count degrades to the cached message list below.
             }
           }),
         )
@@ -133,8 +119,8 @@ export default Plugin.define({
             assistantCount = context.data.session.message
               .list(memberID)
               .filter(message => message.type === "assistant").length
-          } catch (error) {
-            debug("list-error", { sessionID: memberID, error: String(error) })
+          } catch {
+            // Keep a zero request count for this member.
           }
           return {
             id: memberID,
@@ -150,47 +136,87 @@ export default Plugin.define({
           }
         })
         const usage = sessionTreeUsage(sessionID, family)
-        debug("totals", { sessionID, tree: usage.tree })
         if (disposed) return
-        storeAndPublish(sessionID, usage)
-      } catch (error) {
-        debug("refresh-error", { sessionID, error: String(error) })
+        lastSessionID = sessionID
+        lastUsage = usage
+        const key = `${sessionID}:${JSON.stringify(usage.tree)}`
+        if (key === lastKey) return
+        lastKey = key
+        publish(formatUsageSegments(usage, context.renderer.width))
+      } catch {
+        // Keep the last published snapshot on transient failures.
       } finally {
         inFlight.delete(sessionID)
+        if (queued.delete(sessionID) && !disposed) scheduleRefresh(sessionID)
       }
     }
 
-    let lastSessionID: string | undefined
-    let lastUsage: SessionTreeUsage | undefined
+    const scheduleRefresh = (sessionID: string): void => {
+      if (disposed) return
+      if (inFlight.has(sessionID)) {
+        queued.add(sessionID)
+        return
+      }
+      queued.add(sessionID)
+      if (debounceTimer !== undefined) return
+      debounceTimer = setTimeout(() => {
+        debounceTimer = undefined
+        if (disposed) return
+        const ids = [...queued]
+        queued.clear()
+        for (const id of ids) void refresh(id)
+      }, DEBOUNCE_MS)
+    }
+
+    /** Refresh the visible session when one of its family members reports usage. */
+    const onFamilyEvent = (eventSessionID: string): void => {
+      const current = currentSessionID()
+      if (current === undefined) return
+      if (eventSessionID === current) {
+        scheduleRefresh(current)
+        return
+      }
+      try {
+        if (context.data.session.family(current).includes(eventSessionID)) scheduleRefresh(current)
+      } catch {
+        scheduleRefresh(current)
+      }
+    }
+
+    unsubscribers.push(
+      context.data.on("session.usage.updated", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.execution.started", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.execution.succeeded", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.execution.failed", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.execution.interrupted", event => onFamilyEvent(event.data.sessionID)),
+    )
 
     const tick = (): void => {
       if (disposed) return
       const sessionID = currentSessionID()
       if (sessionID === undefined) return
       if (sessionID !== lastSessionID || lastUsage === undefined || treeIsBusy(lastUsage)) {
-        lastSessionID = sessionID
-        void refresh(sessionID)
+        scheduleRefresh(sessionID)
       }
-    }
-
-    const storeAndPublish = (sessionID: string, usage: SessionTreeUsage): void => {
-      lastSessionID = sessionID
-      lastUsage = usage
-      const key = `${sessionID}:${JSON.stringify(usage.tree)}`
-      if (key === lastKey) return
-      lastKey = key
-      publish(formatUsageSegments(usage, context.renderer.width))
     }
 
     // Placeholder until the first snapshot lands.
     const placeholder: UsageLine = [{ text: "…", tone: "metric" }]
     publish([placeholder])
     tick()
-    const timer = setInterval(tick, 2000)
+    const timer = setInterval(tick, FALLBACK_POLL_MS)
 
     return () => {
       disposed = true
       clearInterval(timer)
+      if (debounceTimer !== undefined) clearTimeout(debounceTimer)
+      for (const unsubscribe of unsubscribers) {
+        try {
+          unsubscribe()
+        } catch {
+          // Best effort on teardown.
+        }
+      }
       try {
         disposeSlot?.()
       } catch {

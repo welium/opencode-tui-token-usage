@@ -7,8 +7,9 @@ longer load.
 
 The footer renders `MAIN` / `TOT` usage lines (input/out/cache/think/write,
 request and agent counts, cache hit-rate, cost) for the current session and
-its whole session family, refreshing every 2 seconds while the tree is
-running.
+its whole session family. Refreshes are event-driven (`session.usage.updated`
+plus execution start/finish, debounced) with a 15s fallback poll for session
+switches and missed events.
 
 Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 
@@ -81,6 +82,15 @@ lines, the narrow-layout fallback, and the 2-second refresh while busy.
   (`SessionInfo.tokens`/`cost`; messages carry neither), so totals are
   summed per family member via `data.session.get`/`cost`, with the request
   count still derived from each session's assistant message count.
+- Updates: refreshes trigger on `session.usage.updated` and execution
+  start/finish events (debounced) instead of fixed polling; a 15s poll
+  remains as fallback for tab switches and missed events.
+- Rendering: the slot claim is re-registered per changed snapshot with
+  fully static content. Signal updates were observed never to propagate
+  into slot JSX from an installed package (while fresh mounts render
+  reliably), so the render path uses no signals, effects, or conditional
+  helpers. Suspected cause: the managed install materializes nested
+  `solid-js`/`@opentui` copies that shadow the host runtime.
 
 ## Development
 
