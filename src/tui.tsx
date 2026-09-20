@@ -25,7 +25,7 @@ import {
 } from "./core"
 
 const DEBOUNCE_MS = 400
-const FALLBACK_POLL_MS = 15_000
+const FALLBACK_POLL_MS = 60_000
 
 export default Plugin.define({
   id: "token-tracker.tui",
@@ -137,6 +137,8 @@ export default Plugin.define({
         })
         const usage = sessionTreeUsage(sessionID, family)
         if (disposed) return
+        // Drop stale completions: only the router-current session owns the footer.
+        if (currentSessionID() !== sessionID) return
         lastSessionID = sessionID
         lastUsage = usage
         const key = `${sessionID}:${JSON.stringify(usage.tree)}`
@@ -189,6 +191,10 @@ export default Plugin.define({
       context.data.on("session.execution.succeeded", event => onFamilyEvent(event.data.sessionID)),
       context.data.on("session.execution.failed", event => onFamilyEvent(event.data.sessionID)),
       context.data.on("session.execution.interrupted", event => onFamilyEvent(event.data.sessionID)),
+      // Session open/switch and fresh server connections: instant first paint.
+      context.data.on("session.viewed", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.created", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("server.connected", () => tick()),
     )
 
     const tick = (): void => {
