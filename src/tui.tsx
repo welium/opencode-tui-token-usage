@@ -3,28 +3,29 @@
  *
  * Displays recorded token usage for the current session and all descendants.
  *
- * State lives at setup scope (never inside the slot render): the footer
- * render is a pure reader of the latest snapshot, refreshed on a setup-owned
- * 2s timer while the tree is running. Per-render signals/timers miss updates
- * when the host disposes render roots, freezing the footer at zeros.
+ * Update model: re-register the slot claim per refresh with fully static
+ * content. Signal updates do not propagate into slot JSX from an installed
+ * package (proven over diag1-diag4: 126 computed snapshots, zero
+ * re-renders), while fresh mounts render reliably. Data (not components)
+ * is therefore swapped by dispose + re-register; the render itself closes
+ * over plain values and uses no signals, effects, or conditional helpers.
  */
 
 /** @jsxImportSource @opentui/solid */
 import { appendFileSync } from "node:fs"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
-import { createSignal } from "solid-js"
 import {
-  emptySession,
   formatUsageSegments,
   sessionTreeUsage,
   type FamilySessionUsage,
   type SessionTreeUsage,
+  type UsageLine,
   type UsageSegmentTone,
 } from "./core"
 
-// TEMPORARY diagnostic tracing (removed before the final cleanup).
+// TEMPORARY diagnostic tracing (removed once numbers are confirmed live).
 const DEBUG_LOG = "/tmp/opencode/tui-token-usage-debug.log"
-const DEBUG_BUILD = "diag4"
+const DEBUG_BUILD = "diag5"
 const debug = (event: string, entry: Record<string, unknown>): void => {
   try {
     appendFileSync(
@@ -36,91 +37,49 @@ const debug = (event: string, entry: Record<string, unknown>): void => {
   }
 }
 
-type Snapshot = {
-  readonly sessionID: string
-  readonly usage: SessionTreeUsage
-}
-
-function TokenFooter(props: {
-  sessionID: string
-  snapshot: () => Snapshot | undefined
-  ensure: (sessionID: string) => void
-}) {
-  const context = usePlugin()
-
-  const data = (): SessionTreeUsage | undefined => {
-    const snap = props.snapshot()
-    return snap !== undefined && snap.sessionID === props.sessionID ? snap.usage : undefined
-  }
-
-  if (data() === undefined) {
-    debug("render-mount-missing", { sessionID: props.sessionID })
-    props.ensure(props.sessionID)
-  }
-
-  const usageLines = () => {
-    const usage = data()
-    if (usage === undefined) return []
-    try {
-      const width = context.renderer.width
-      const lines = formatUsageSegments(usage, width)
-      debug("render-lines", {
-        sessionID: props.sessionID,
-        width,
-        tree: usage.tree,
-        texts: lines.map(line => line.map(segment => segment.text).join("")),
-      })
-      return lines
-    } catch (error) {
-      debug("render-lines-error", { sessionID: props.sessionID, error: String(error) })
-      throw error
-    }
-  }
-
-  const segmentColor = (tone: UsageSegmentTone) => {
-    try {
-      if (tone === "label") return context.theme.text.action.primary.base
-      if (tone === "metric" || tone === "separator") return context.theme.text.muted
-      return context.theme.text.base
-    } catch (error) {
-      debug("render-color-error", { sessionID: props.sessionID, tone, error: String(error) })
-      try {
-        return context.theme.text.base
-      } catch {
-        return undefined
-      }
-    }
-  }
-
-  const lines = usageLines()
-  if (lines.length === 0) {
-    debug("render-fallback", { sessionID: props.sessionID })
-    return (
-      <text>
-        <span>…</span>
-      </text>
-    )
-  }
-  return (
-    <box>
-      {lines.map(line => (
-        <text>
-          {line.map(segment => (
-            <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
-          ))}
-        </text>
-      ))}
-    </box>
-  )
-}
-
 export default Plugin.define({
   id: "token-tracker.tui",
   setup(context) {
     debug("setup", { options: context.options })
-    const [snapshot, setSnapshot] = createSignal<Snapshot | undefined>(undefined)
-    const inFlight = new Set<string>()
+    let disposeSlot: (() => void) | undefined
     let disposed = false
+    const inFlight = new Set<string>()
+    let lastKey = ""
+
+    const segmentColor = (tone: UsageSegmentTone) => {
+      if (tone === "label") return context.theme.text.action.primary.base
+      if (tone === "metric" || tone === "separator") return context.theme.text.muted
+      return context.theme.text.base
+    }
+
+    const publish = (lines: readonly UsageLine[]): void => {
+      if (disposed) return
+      try {
+        disposeSlot?.()
+      } catch (error) {
+        debug("dispose-error", { error: String(error) })
+      }
+      try {
+        disposeSlot = context.ui.slot({
+          append: "sidebar.footer",
+          render: () => (
+            <box>
+              {lines.map(line => (
+                <text>
+                  {line.map(segment => (
+                    <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
+                  ))}
+                </text>
+              ))}
+            </box>
+          ),
+        })
+        debug("publish", { lines: lines.map(line => line.map(segment => segment.text).join("")) })
+      } catch (error) {
+        debug("publish-error", { error: String(error) })
+        disposeSlot = undefined
+      }
+    }
 
     const currentSessionID = (): string | undefined => {
       try {
@@ -149,19 +108,16 @@ export default Plugin.define({
         const sessionIDs = [...new Set([sessionID, ...familyIDs])]
         await Promise.all(
           sessionIDs.map(async memberID => {
-            let sessionSync = "ok"
             try {
               await context.data.session.sync(memberID)
-            } catch (error) {
-              sessionSync = String(error)
+            } catch {
+              // Fall through to message sync; member degrades to cached data.
             }
-            let messageSync = "ok"
             try {
               await context.data.session.message.sync(memberID)
             } catch (error) {
-              messageSync = String(error)
+              debug("message-sync-error", { sessionID: memberID, error: String(error) })
             }
-            return { memberID, sessionSync, messageSync }
           }),
         )
         const family: FamilySessionUsage[] = sessionIDs.map(memberID => {
@@ -194,8 +150,9 @@ export default Plugin.define({
           }
         })
         const usage = sessionTreeUsage(sessionID, family)
-        debug("totals", { sessionID, root: usage.root, tree: usage.tree })
-        if (!disposed) setSnapshot({ sessionID, usage })
+        debug("totals", { sessionID, tree: usage.tree })
+        if (disposed) return
+        storeAndPublish(sessionID, usage)
       } catch (error) {
         debug("refresh-error", { sessionID, error: String(error) })
       } finally {
@@ -203,33 +160,42 @@ export default Plugin.define({
       }
     }
 
-    const ensure = (sessionID: string): void => {
-      if (snapshot()?.sessionID !== sessionID) {
-        debug("ensure", { sessionID })
+    let lastSessionID: string | undefined
+    let lastUsage: SessionTreeUsage | undefined
+
+    const tick = (): void => {
+      if (disposed) return
+      const sessionID = currentSessionID()
+      if (sessionID === undefined) return
+      if (sessionID !== lastSessionID || lastUsage === undefined || treeIsBusy(lastUsage)) {
+        lastSessionID = sessionID
         void refresh(sessionID)
       }
     }
 
-    const tick = (): void => {
-      const sessionID = currentSessionID()
-      if (sessionID === undefined || disposed) return
-      const snap = snapshot()
-      if (snap?.sessionID !== sessionID || treeIsBusy(snap.usage)) void refresh(sessionID)
+    const storeAndPublish = (sessionID: string, usage: SessionTreeUsage): void => {
+      lastSessionID = sessionID
+      lastUsage = usage
+      const key = `${sessionID}:${JSON.stringify(usage.tree)}`
+      if (key === lastKey) return
+      lastKey = key
+      publish(formatUsageSegments(usage, context.renderer.width))
     }
 
-    void tick()
+    // Placeholder until the first snapshot lands.
+    const placeholder: UsageLine = [{ text: "…", tone: "metric" }]
+    publish([placeholder])
+    tick()
     const timer = setInterval(tick, 2000)
 
-    const disposeSlot = context.ui.slot({
-      append: "sidebar.footer",
-      render: ({ sessionID }) => (
-        <TokenFooter sessionID={sessionID} snapshot={snapshot} ensure={ensure} />
-      ),
-    })
     return () => {
       disposed = true
       clearInterval(timer)
-      disposeSlot()
+      try {
+        disposeSlot?.()
+      } catch {
+        // Best effort on teardown.
+      }
     }
   },
 })
