@@ -12,7 +12,7 @@
 /** @jsxImportSource @opentui/solid */
 import { appendFileSync } from "node:fs"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
-import { createEffect, createSignal, Show } from "solid-js"
+import { createSignal } from "solid-js"
 import {
   emptySession,
   formatUsageSegments,
@@ -24,7 +24,7 @@ import {
 
 // TEMPORARY diagnostic tracing (removed before the final cleanup).
 const DEBUG_LOG = "/tmp/opencode/tui-token-usage-debug.log"
-const DEBUG_BUILD = "diag3"
+const DEBUG_BUILD = "diag4"
 const debug = (event: string, entry: Record<string, unknown>): void => {
   try {
     appendFileSync(
@@ -53,9 +53,10 @@ function TokenFooter(props: {
     return snap !== undefined && snap.sessionID === props.sessionID ? snap.usage : undefined
   }
 
-  createEffect(() => {
-    if (data() === undefined) props.ensure(props.sessionID)
-  })
+  if (data() === undefined) {
+    debug("render-mount-missing", { sessionID: props.sessionID })
+    props.ensure(props.sessionID)
+  }
 
   const usageLines = () => {
     const usage = data()
@@ -91,25 +92,25 @@ function TokenFooter(props: {
     }
   }
 
+  const lines = usageLines()
+  if (lines.length === 0) {
+    debug("render-fallback", { sessionID: props.sessionID })
+    return (
+      <text>
+        <span>…</span>
+      </text>
+    )
+  }
   return (
-    <Show
-      when={data()}
-      fallback={
+    <box>
+      {lines.map(line => (
         <text>
-          <span>…</span>
+          {line.map(segment => (
+            <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
+          ))}
         </text>
-      }
-    >
-      <box>
-        {usageLines().map(line => (
-          <text>
-            {line.map(segment => (
-              <span style={{ fg: segmentColor(segment.tone) }}>{segment.text}</span>
-            ))}
-          </text>
-        ))}
-      </box>
-    </Show>
+      ))}
+    </box>
   )
 }
 
