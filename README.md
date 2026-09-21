@@ -7,8 +7,8 @@ longer load.
 
 The footer renders `MAIN` / `TOT` usage lines (input/out/cache/think/write,
 request and agent counts, cache hit-rate, cost) for the current session and
-its whole session family. A live throughput line is prepended while an
-assistant response streams (rolling `est.` tok/s, average tok/s, estimated
+its whole session family. A live throughput section is prepended while an
+assistant response streams (rolling tok/s, average tok/s, estimated
 output tokens, elapsed time), replaced by a final `✓` summary with
 provider-reported totals when the step ends. Refreshes are event-driven
 (`session.usage.updated`,
@@ -35,19 +35,25 @@ Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 ## Live throughput
 
 Design reference: `npm:pi-live-throughput` as used in the Pi coding agent.
-While a response streams, the footer prepends a single live line:
+While a response streams, the footer prepends a labeled section styled
+like the MAIN/TOT blocks (7-cell label column, continuation indent):
 
 ```text
-⚡ est. 92.3 tok/s · avg 84.5 tok/s · ~1.2k tok · 14.2s · gpt-5-mini
+⚡       ~92.3 tok/s · avg 84.5
+       ~1.2k tok · 14.2s
 ```
 
 When the step ends it is replaced by a final summary that persists until
 the next response starts:
 
 ```text
-✓ 512 tok in 4.2s · 120 tok/s avg · peak 319 tok/s
-  input 1.2k tok · cache read 8.0k tok · TTFT 800ms · approx. prompt 1500 tok/s
+✓        512 tok · 120 tok/s avg
+       peak 319 tok/s · 4.2s
+       TTFT 420ms · input 1.2k tok
 ```
+
+Over-wide rows fall back to a narrow one-metric-per-line layout, the same
+primary/narrow strategy `core.ts` uses for MAIN/TOT.
 
 Adaptations for OpenCode: provider token counts are exposed only at step
 boundaries (`session.step.ended`), never during the stream, so all live

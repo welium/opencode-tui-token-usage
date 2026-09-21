@@ -3,14 +3,18 @@
  *
  * Design reference: `npm:pi-live-throughput` as used in the Pi coding agent.
  * While an assistant response streams, the footer shows a rolling rate,
- * average rate, estimated output tokens, and elapsed time:
+ * average rate, estimated output tokens, and elapsed time, laid out as a
+ * labeled section that mirrors the MAIN/TOT blocks in core.ts:
  *
- *   `⚡ est. 92.3 tok/s · avg 84.5 tok/s · ~1.2k tok · 14.2s`
+ *   `⚡       ~92.3 tok/s · avg 84.5`
+ *   `       ~1.2k tok · 14.2s`
  *
- * When streaming finishes, the live line is replaced with a final summary
+ * When streaming finishes, the live lines are replaced with a final summary
  * that stays visible until the next response starts:
  *
- *   `✓ 512 tok in 2.0s · 256 tok/s avg · peak 319 tok/s · TTFT 420ms`
+ *   `✓        512 tok · 120 tok/s avg`
+ *   `       peak 319 tok/s · 4.2s`
+ *   `       TTFT 420ms · input 1.2k tok`
  *
  * OpenCode adaptation notes (vs Pi):
  * - Pi prefers cumulative provider-reported `usage.output` while streaming
@@ -234,84 +238,117 @@ export function finalizeThroughputEstimate(stream: StreamingThroughput, now: num
   )
 }
 
-const liveLine = (stream: StreamingThroughput, now: number, compact: boolean): UsageLine => {
+/**
+ * Label column mirrors the MAIN/TOT sections in core.ts: a 7-cell label
+ * followed by metrics, with continuation lines indented 7 spaces. The
+ * state icons double as the labels (⚡ spans 2 cells + 5 spaces, ✓ spans
+ * 1 cell + 6 spaces), so the block reads as a sibling of MAIN/TOT.
+ */
+const liveLabel = (): UsageSegment => ({ text: "⚡     ", tone: "label" })
+const doneLabel = (): UsageSegment => ({ text: "✓      ", tone: "label" })
+const continuation = (content: UsageLine): UsageLine => [label("       "), ...content]
+
+const refreshLiveRate = (stream: StreamingThroughput, now: number): number => {
   const live = rollingRate(stream, now)
   stream.peakRate = Math.max(stream.peakRate, live)
-  const outputTokens = liveOutputTokens(stream)
-  if (stream.measurementStartTime === undefined || compact) {
-    if (compact) {
-      return [
-        label("⚡ "),
-        metric("est. "),
-        value(formatThroughputRate(live)),
-        metric(" tok/s"),
-        separator(),
-        metric("~"),
-        value(formatTokenCount(outputTokens)),
-        metric(" tok"),
-      ]
-    }
-    return [
-      label("⚡ "),
-      metric("~"),
-      value(formatTokenCount(outputTokens)),
-      metric(" tok"),
-      separator(),
-      value(Math.max(0, (now - stream.responseStartTime) / 1_000).toFixed(1)),
-      metric("s"),
-    ]
-  }
-  const average = liveAverageRate(stream, now)
-  const elapsed = liveElapsedSec(stream, now)
-  const line: UsageSegment[] = [
-    label("⚡ "),
-    metric("est. "),
-    value(formatThroughputRate(live)),
-    metric(" tok/s"),
-    separator(),
-    metric("avg "),
-    value(formatThroughputRate(average)),
-    metric(" tok/s"),
-    separator(),
-    metric("~"),
-    value(formatTokenCount(outputTokens)),
-    metric(" tok"),
-    separator(),
-    value(Math.max(0, elapsed).toFixed(1)),
-    metric("s"),
-  ]
-  if (stream.model) line.push(separator(), metric(stream.model))
-  return line
+  return live
 }
 
-const finalCompactLine = (final: FinalThroughput): UsageLine => [
-  label("✓ "),
+const livePendingLine = (stream: StreamingThroughput, now: number): UsageLine => [
+  liveLabel(),
+  metric("~"),
+  value(formatTokenCount(liveOutputTokens(stream))),
+  metric(" tok"),
+  separator(),
+  value(Math.max(0, (now - stream.responseStartTime) / 1_000).toFixed(1)),
+  metric("s"),
+]
+
+const livePrimaryLines = (stream: StreamingThroughput, now: number): UsageLine[] => {
+  if (stream.measurementStartTime === undefined) return [livePendingLine(stream, now)]
+  const live = refreshLiveRate(stream, now)
+  const average = liveAverageRate(stream, now)
+  const elapsed = liveElapsedSec(stream, now)
+  return [
+    [
+      liveLabel(),
+      metric("~"),
+      value(formatThroughputRate(live)),
+      metric(" tok/s"),
+      separator(),
+      metric("avg "),
+      value(formatThroughputRate(average)),
+    ],
+    continuation([
+      metric("~"),
+      value(formatTokenCount(liveOutputTokens(stream))),
+      metric(" tok"),
+      separator(),
+      value(Math.max(0, elapsed).toFixed(1)),
+      metric("s"),
+    ]),
+  ]
+}
+
+/** Same metrics as primary, one per line — mirrors core's narrow layout. */
+const liveNarrowLines = (stream: StreamingThroughput, now: number): UsageLine[] => {
+  if (stream.measurementStartTime === undefined) return [livePendingLine(stream, now)]
+  const live = refreshLiveRate(stream, now)
+  const average = liveAverageRate(stream, now)
+  const elapsed = liveElapsedSec(stream, now)
+  return [
+    [liveLabel(), metric("~"), value(formatThroughputRate(live)), metric(" tok/s")],
+    continuation([metric("~"), value(formatTokenCount(liveOutputTokens(stream))), metric(" tok")]),
+    continuation([metric("avg "), value(formatThroughputRate(average)), metric(" tok/s")]),
+    continuation([value(Math.max(0, elapsed).toFixed(1)), metric("s")]),
+  ]
+}
+
+const finalHeadline = (final: FinalThroughput): UsageLine => [
+  doneLabel(),
   value(formatTokenCount(final.outputTokens)),
   metric(" tok · "),
   value(formatThroughputRate(final.averageRate)),
-  metric(" tok/s"),
-]
-
-const ultraCompactLive = (stream: StreamingThroughput, now: number): UsageLine => [
-  label("⚡ "),
-  value(formatThroughputRate(rollingRate(stream, now))),
-  metric(" tok/s"),
-]
-
-const finalSummaryLine = (final: FinalThroughput): UsageLine => [
-  label("✓ "),
-  value(formatTokenCount(final.outputTokens)),
-  metric(" tok in "),
-  value(final.elapsedSec.toFixed(1)),
-  metric("s"),
-  separator(),
-  value(formatThroughputRate(final.averageRate)),
   metric(" tok/s avg"),
-  separator(),
-  metric("peak "),
-  value(formatThroughputRate(final.peakRate)),
-  metric(" tok/s"),
 ]
+
+const finalSubline = (final: FinalThroughput): UsageLine =>
+  continuation([
+    metric("peak "),
+    value(formatThroughputRate(final.peakRate)),
+    metric(" tok/s"),
+    separator(),
+    value(final.elapsedSec.toFixed(1)),
+    metric("s"),
+  ])
+
+const finalPrimaryLines = (final: FinalThroughput, width: number): UsageLine[] => {
+  const lines = [finalHeadline(final), finalSubline(final)]
+  // Prompt details ride a third continuation line, dropping trailing
+  // groups (model first) until it fits.
+  const remaining = [...finalPromptGroups(final)]
+  while (remaining.length > 0) {
+    const extra = continuation(joinGroups(remaining))
+    if (lineText(extra).length <= width) return [...lines, extra]
+    remaining.pop()
+  }
+  return lines
+}
+
+/** Same metrics as primary, one per line — mirrors core's narrow layout. */
+const finalNarrowLines = (final: FinalThroughput, width: number): UsageLine[] => {
+  const lines: UsageLine[] = [
+    [doneLabel(), value(formatTokenCount(final.outputTokens)), metric(" tok")],
+    continuation([value(formatThroughputRate(final.averageRate)), metric(" tok/s avg")]),
+    continuation([metric("peak "), value(formatThroughputRate(final.peakRate)), metric(" tok/s")]),
+    continuation([value(final.elapsedSec.toFixed(1)), metric("s")]),
+  ]
+  for (const group of finalPromptGroups(final)) {
+    const extra = continuation(group)
+    if (lineText(extra).length <= width) lines.push(extra)
+  }
+  return lines
+}
 
 const finalPromptGroups = (final: FinalThroughput): UsageLine[] => {
   const groups: UsageLine[] = []
@@ -342,9 +379,9 @@ const joinGroups = (groups: ReadonlyArray<UsageLine>): UsageLine =>
   groups.flatMap((group, index) => (index === 0 ? group : [separator(), ...group]))
 
 /**
- * Format the throughput snapshot as styled footer lines. Every emitted row
- * is measured before it is returned; over-wide rows fall back to compact
- * or continuation layouts instead of wrapping.
+ * Format the throughput snapshot as styled footer lines. The layout mirrors
+ * the MAIN/TOT sections: primary lines first, falling back to a narrow
+ * one-metric-per-line layout when any primary row exceeds the width.
  */
 export function formatThroughputLines(
   state: ThroughputState | undefined,
@@ -354,28 +391,13 @@ export function formatThroughputLines(
   const normalizedWidth = Math.max(1, Math.floor(width))
   if (state === undefined) return []
   if (state.kind === "streaming") {
-    const full = liveLine(state, now, false)
-    if (lineText(full).length <= normalizedWidth) return [full]
-    const compact = liveLine(state, now, true)
-    if (lineText(compact).length <= normalizedWidth) return [compact]
-    return [ultraCompactLive(state, now)]
+    const primary = livePrimaryLines(state, now)
+    if (primary.every(line => lineText(line).length <= normalizedWidth)) return primary
+    return liveNarrowLines(state, now)
   }
-  const summary = finalSummaryLine(state)
-  const headline = lineText(summary).length <= normalizedWidth ? summary : finalCompactLine(state)
-  const groups = finalPromptGroups(state)
-  if (groups.length === 0) return [headline]
-  if (headline === summary) {
-    const combined: UsageLine = [...summary, separator(), ...joinGroups(groups)]
-    if (lineText(combined).length <= normalizedWidth) return [combined]
-  }
-  // Drop trailing detail groups (model first) until the continuation fits.
-  const remaining = [...groups]
-  while (remaining.length > 0) {
-    const continuation: UsageLine = [label("  "), ...joinGroups(remaining)]
-    if (lineText(continuation).length <= normalizedWidth) return [headline, continuation]
-    remaining.pop()
-  }
-  return [headline]
+  const primary = finalPrimaryLines(state, normalizedWidth)
+  if (primary.every(line => lineText(line).length <= normalizedWidth)) return primary
+  return finalNarrowLines(state, normalizedWidth)
 }
 
 /** Join formatted throughput lines for change detection. */
