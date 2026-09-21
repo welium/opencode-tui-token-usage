@@ -35,37 +35,33 @@ Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
 ## Live throughput
 
 Design reference: `npm:pi-live-throughput` as used in the Pi coding agent.
-While a response streams, the footer prepends a labeled section styled
-like the MAIN/TOT blocks (7-cell label column, continuation indent):
+While a response streams, the footer prepends one friendly line with the
+rolling decode rate and tokens so far:
 
 ```text
-⚡       ~92.3 tok/s · avg 84.5
-       ~1.2k tok · 14.2s
+⚡       ~92.3 tok/s · ~1.2k tok
 ```
 
 When the step ends it is replaced by a final summary that persists until
 the next response starts:
 
 ```text
-✓        512 tok · 120 tok/s avg
-       peak 319 tok/s · 4.2s
-       TTFT 420ms · input 1.2k tok
+✓        512 tok · 120 tok/s
 ```
 
-Over-wide rows fall back to a narrow one-metric-per-line layout, the same
-primary/narrow strategy `core.ts` uses for MAIN/TOT.
+Only headline numbers are shown — no model (already in the main panel),
+no peak/elapsed/TTFT/prompt breakdown (prompt totals live in TOT).
+Over-narrow terminals drop the secondary metric, keeping the headline
+number.
 
 Adaptations for OpenCode: provider token counts are exposed only at step
-boundaries (`session.step.ended`), never during the stream, so all live
+boundaries (`session.step.ended`), never during the stream, so live
 figures are chars/4 heuristic estimates over text, reasoning, and
-tool-input deltas (labeled `est.` / `~`); the final summary always uses
-provider-reported step tokens. TTFT runs from `session.execution.started`
-(fallback: `session.step.started`) to the first delta, and rate measurement
-starts only after a second output token so TTFT never dilutes the rolling
-(3s window), average, or peak rates. Live updates are delta-driven at up to
-4Hz plus a 1Hz tick refresh, perform no server sync, and reuse the static
-slot re-registration path; over-wide rows fall back to compact or
-continuation layouts instead of wrapping.
+tool-input deltas (marked `~`); the final summary always uses
+provider-reported step tokens. Rate measurement starts only after a
+second output token so early latency never dilutes the rates. Live
+updates are delta-driven at up to 4Hz plus a 1Hz tick refresh, perform
+no server sync, and reuse the static slot re-registration path.
 
 Only `src/index.ts` and `src/tui.tsx` are package entries, so `src/core.ts`
 is never probed as a plugin — this is what caused the old

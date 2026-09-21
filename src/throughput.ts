@@ -2,35 +2,33 @@
  * Live token-throughput tracking for the token-tracker footer.
  *
  * Design reference: `npm:pi-live-throughput` as used in the Pi coding agent.
- * While an assistant response streams, the footer shows a rolling rate,
- * average rate, estimated output tokens, and elapsed time, laid out as a
- * labeled section that mirrors the MAIN/TOT blocks in core.ts:
+ * While an assistant response streams, the footer shows one friendly line
+ * with the rolling decode rate and tokens so far:
  *
- *   `⚡       ~92.3 tok/s · avg 84.5`
- *   `       ~1.2k tok · 14.2s`
+ *   `⚡       ~92.3 tok/s · ~1.2k tok`
  *
- * When streaming finishes, the live lines are replaced with a final summary
- * that stays visible until the next response starts:
+ * When streaming finishes it is replaced with a final summary that stays
+ * visible until the next response starts:
  *
- *   `✓        512 tok · 120 tok/s avg`
- *   `       peak 319 tok/s · 4.2s`
- *   `       TTFT 420ms · input 1.2k tok`
+ *   `✓        512 tok · 120 tok/s`
+ *
+ * Only the highest-signal numbers are shown: live rate + output tokens
+ * while streaming, output tokens + average rate when done. Peak, elapsed,
+ * TTFT, per-step prompt details, and model are deliberately omitted — the
+ * model is already visible in the main panel and prompt totals live in the
+ * TOT lines. The block mirrors the MAIN/TOT sections in core.ts (7-cell
+ * label column, continuation indent).
  *
  * OpenCode adaptation notes (vs Pi):
  * - Pi prefers cumulative provider-reported `usage.output` while streaming
  *   and falls back to a chars/4 heuristic. OpenCode only exposes provider
  *   token counts at step boundaries (`session.step.ended`), never during
- *   the stream, so all live figures are heuristic estimates (chars/4 over
- *   text, reasoning, and tool-input deltas), labeled `est.`/`~` per Pi's
- *   fallback convention. The final summary always uses provider-reported
- *   step tokens.
- * - Pi measures TTFT from `before_provider_request` to first output. Here
- *   TTFT is measured from `session.execution.started` (fallback:
- *   `session.step.started`) to the first substantive delta, using local
- *   receipt timestamps throughout so the window is self-consistent.
- * - Throughput measurement starts only after a second output token has
- *   been observed, so TTFT never dilutes rolling/average/peak rates. The
- *   token counters still report cumulative response output.
+ *   the stream, so live figures are heuristic estimates (chars/4 over
+ *   text, reasoning, and tool-input deltas), marked `~`. The final summary
+ *   always uses provider-reported step tokens.
+ * - Rate measurement starts only after a second output token has been
+ *   observed, so time-to-first-token never dilutes the rolling or average
+ *   rates. The token counters still report cumulative response output.
  *
  * Pure module with no plugin entrypoint: only `src/index.ts` (`.`) and
  * `src/tui.tsx` (`./tui`) are package entries.
@@ -50,32 +48,16 @@ export type ThroughputSample = {
 export type StreamingThroughput = {
   readonly kind: "streaming"
   responseStartTime: number
-  requestTime: number | undefined
-  firstOutputTime: number | undefined
   measurementStartTime: number | undefined
   measurementBaseline: number
   totalChars: number
   samples: ThroughputSample[]
-  peakRate: number
-  model: string
-}
-
-export type ThroughputPromptMetrics = {
-  readonly inputTokens: number | undefined
-  readonly cacheReadTokens: number | undefined
-  readonly cacheWriteTokens: number | undefined
-  readonly ttftMs: number | undefined
-  readonly approximatePromptRate: number | undefined
 }
 
 export type FinalThroughput = {
   readonly kind: "final"
   readonly outputTokens: number
-  readonly elapsedSec: number
   readonly averageRate: number
-  readonly peakRate: number
-  readonly model: string
-  readonly prompt: ThroughputPromptMetrics
 }
 
 export type ThroughputState = StreamingThroughput | FinalThroughput
@@ -83,31 +65,20 @@ export type ThroughputState = StreamingThroughput | FinalThroughput
 export const formatThroughputRate = (rate: number): string =>
   rate >= 100 ? rate.toFixed(0) : rate.toFixed(1)
 
-const formatTtft = (ms: number): string =>
-  ms < 1_000 ? `${Math.round(ms)}ms` : `${(ms / 1_000).toFixed(2)}s`
-
-const positiveMetric = (value: number): number | undefined =>
-  Number.isFinite(value) && value > 0 ? value : undefined
-
 const separator = (): UsageSegment => ({ text: " · ", tone: "separator" })
 const metric = (text: string): UsageSegment => ({ text, tone: "metric" })
 const value = (text: string): UsageSegment => ({ text, tone: "value" })
-const label = (text: string): UsageSegment => ({ text, tone: "label" })
 
 const lineText = (line: UsageLine): string => line.map(segment => segment.text).join("")
 
-export function createStreamingThroughput(now: number, requestTime?: number, model = ""): StreamingThroughput {
+export function createStreamingThroughput(now: number): StreamingThroughput {
   return {
     kind: "streaming",
     responseStartTime: now,
-    requestTime,
-    firstOutputTime: undefined,
     measurementStartTime: undefined,
     measurementBaseline: 0,
     totalChars: 0,
     samples: [],
-    peakRate: 0,
-    model,
   }
 }
 
@@ -138,7 +109,6 @@ const startMeasurementIfReady = (stream: StreamingThroughput, now: number): bool
   stream.measurementStartTime = now
   stream.measurementBaseline = liveOutputTokens(stream)
   stream.samples = []
-  stream.peakRate = 0
   return true
 }
 
@@ -149,7 +119,6 @@ const startMeasurementIfReady = (stream: StreamingThroughput, now: number): bool
  */
 export function recordThroughputDelta(stream: StreamingThroughput, chars: number, now: number): boolean {
   if (chars > 0) {
-    if (stream.firstOutputTime === undefined) stream.firstOutputTime = now
     stream.totalChars += chars
     if (stream.measurementStartTime !== undefined) {
       stream.samples.push({ t: now, tokens: estimatedTokens(chars) })
@@ -158,230 +127,90 @@ export function recordThroughputDelta(stream: StreamingThroughput, chars: number
   return startMeasurementIfReady(stream, now)
 }
 
-export const liveAverageRate = (stream: StreamingThroughput, now: number): number => {
-  if (stream.measurementStartTime === undefined) return 0
-  const elapsedSec = (now - stream.measurementStartTime) / 1_000
-  return elapsedSec > 0 ? measuredOutputTokens(stream, liveOutputTokens(stream)) / elapsedSec : 0
-}
-
-export const liveElapsedSec = (stream: StreamingThroughput, now: number): number =>
-  stream.measurementStartTime === undefined
-    ? (now - stream.responseStartTime) / 1_000
-    : (now - stream.measurementStartTime) / 1_000
-
-const ttftMs = (stream: StreamingThroughput): number | undefined =>
-  stream.requestTime !== undefined && stream.firstOutputTime !== undefined
-    ? Math.max(0, stream.firstOutputTime - stream.requestTime)
-    : undefined
-
-const promptMetrics = (
-  stream: StreamingThroughput,
-  usage: { input: number; cacheRead: number; cacheWrite: number },
-): ThroughputPromptMetrics => {
-  const inputTokens = positiveMetric(usage.input)
-  const cacheReadTokens = positiveMetric(usage.cacheRead)
-  const cacheWriteTokens = positiveMetric(usage.cacheWrite)
-  const ttft = ttftMs(stream)
-  const processedTokens = (inputTokens ?? 0) + (cacheWriteTokens ?? 0)
-  const approximatePromptRate =
-    processedTokens > 0 && ttft !== undefined && ttft > 0 ? processedTokens / (ttft / 1_000) : undefined
-  return {
-    inputTokens,
-    cacheReadTokens,
-    cacheWriteTokens,
-    ttftMs: ttft,
-    approximatePromptRate,
-  }
-}
-
 /**
- * Finalize with provider-reported step tokens. When the measured window
- * captured less than one full output token, whole-response timing is used
- * instead of reporting a misleading near-zero rate.
+ * Finalize with provider-reported step output tokens. When the measured
+ * window captured less than one full output token, whole-response timing
+ * is used instead of reporting a misleading near-zero rate.
  */
 export function finalizeThroughput(
   stream: StreamingThroughput,
-  providerTokens: { input: number; output: number; cacheRead: number; cacheWrite: number },
+  outputTokens: number,
   now: number,
-  model = stream.model,
 ): FinalThroughput {
+  const output = Number.isFinite(outputTokens) && outputTokens > 0 ? outputTokens : 0
   let measurementStart = stream.measurementStartTime ?? stream.responseStartTime
-  let measuredTokens =
-    stream.measurementStartTime === undefined
-      ? providerTokens.output
-      : measuredOutputTokens(stream, providerTokens.output)
+  let measuredTokens = stream.measurementStartTime === undefined ? output : measuredOutputTokens(stream, output)
   if (measuredTokens < 1) {
     measurementStart = stream.responseStartTime
-    measuredTokens = providerTokens.output
+    measuredTokens = output
   }
   const elapsedSec = (now - measurementStart) / 1_000
-  const averageRate = measuredTokens / Math.max(elapsedSec, 0.001)
-  const peakRate = Math.max(stream.peakRate, rollingRate(stream, now), averageRate)
   return {
     kind: "final",
-    outputTokens: providerTokens.output,
-    elapsedSec,
-    averageRate,
-    peakRate,
-    model,
-    prompt: promptMetrics(stream, providerTokens),
+    outputTokens: output,
+    averageRate: measuredTokens / Math.max(elapsedSec, 0.001),
   }
 }
 
 /** Finalize without provider totals (execution ended with no step report). */
 export function finalizeThroughputEstimate(stream: StreamingThroughput, now: number): FinalThroughput {
-  const outputTokens = Math.round(liveOutputTokens(stream))
-  return finalizeThroughput(
-    stream,
-    { input: 0, output: outputTokens, cacheRead: 0, cacheWrite: 0 },
-    now,
-  )
+  return finalizeThroughput(stream, Math.round(liveOutputTokens(stream)), now)
 }
 
 /**
  * Label column mirrors the MAIN/TOT sections in core.ts: a 7-cell label
- * followed by metrics, with continuation lines indented 7 spaces. The
- * state icons double as the labels (⚡ spans 2 cells + 5 spaces, ✓ spans
- * 1 cell + 6 spaces), so the block reads as a sibling of MAIN/TOT.
+ * with metrics after it. The state icons double as the labels (⚡ spans 2
+ * cells + 5 spaces, ✓ spans 1 cell + 6 spaces).
  */
 const liveLabel = (): UsageSegment => ({ text: "⚡     ", tone: "label" })
 const doneLabel = (): UsageSegment => ({ text: "✓      ", tone: "label" })
-const continuation = (content: UsageLine): UsageLine => [label("       "), ...content]
 
-const refreshLiveRate = (stream: StreamingThroughput, now: number): number => {
-  const live = rollingRate(stream, now)
-  stream.peakRate = Math.max(stream.peakRate, live)
-  return live
-}
-
-const livePendingLine = (stream: StreamingThroughput, now: number): UsageLine => [
+const livePendingLine = (stream: StreamingThroughput): UsageLine => [
   liveLabel(),
   metric("~"),
   value(formatTokenCount(liveOutputTokens(stream))),
   metric(" tok"),
-  separator(),
-  value(Math.max(0, (now - stream.responseStartTime) / 1_000).toFixed(1)),
-  metric("s"),
 ]
 
-const livePrimaryLines = (stream: StreamingThroughput, now: number): UsageLine[] => {
-  if (stream.measurementStartTime === undefined) return [livePendingLine(stream, now)]
-  const live = refreshLiveRate(stream, now)
-  const average = liveAverageRate(stream, now)
-  const elapsed = liveElapsedSec(stream, now)
-  return [
-    [
-      liveLabel(),
-      metric("~"),
-      value(formatThroughputRate(live)),
-      metric(" tok/s"),
-      separator(),
-      metric("avg "),
-      value(formatThroughputRate(average)),
-    ],
-    continuation([
-      metric("~"),
-      value(formatTokenCount(liveOutputTokens(stream))),
-      metric(" tok"),
-      separator(),
-      value(Math.max(0, elapsed).toFixed(1)),
-      metric("s"),
-    ]),
-  ]
-}
+const liveFullLine = (stream: StreamingThroughput, now: number): UsageLine => [
+  liveLabel(),
+  metric("~"),
+  value(formatThroughputRate(rollingRate(stream, now))),
+  metric(" tok/s"),
+  separator(),
+  metric("~"),
+  value(formatTokenCount(liveOutputTokens(stream))),
+  metric(" tok"),
+]
 
-/** Same metrics as primary, one per line — mirrors core's narrow layout. */
-const liveNarrowLines = (stream: StreamingThroughput, now: number): UsageLine[] => {
-  if (stream.measurementStartTime === undefined) return [livePendingLine(stream, now)]
-  const live = refreshLiveRate(stream, now)
-  const average = liveAverageRate(stream, now)
-  const elapsed = liveElapsedSec(stream, now)
-  return [
-    [liveLabel(), metric("~"), value(formatThroughputRate(live)), metric(" tok/s")],
-    continuation([metric("~"), value(formatTokenCount(liveOutputTokens(stream))), metric(" tok")]),
-    continuation([metric("avg "), value(formatThroughputRate(average)), metric(" tok/s")]),
-    continuation([value(Math.max(0, elapsed).toFixed(1)), metric("s")]),
-  ]
-}
+/** Rate-only fallback for very narrow terminals. */
+const liveRateLine = (stream: StreamingThroughput, now: number): UsageLine => [
+  liveLabel(),
+  metric("~"),
+  value(formatThroughputRate(rollingRate(stream, now))),
+  metric(" tok/s"),
+]
 
-const finalHeadline = (final: FinalThroughput): UsageLine => [
+const finalFullLine = (final: FinalThroughput): UsageLine => [
   doneLabel(),
   value(formatTokenCount(final.outputTokens)),
   metric(" tok · "),
   value(formatThroughputRate(final.averageRate)),
-  metric(" tok/s avg"),
+  metric(" tok/s"),
 ]
 
-const finalSubline = (final: FinalThroughput): UsageLine =>
-  continuation([
-    metric("peak "),
-    value(formatThroughputRate(final.peakRate)),
-    metric(" tok/s"),
-    separator(),
-    value(final.elapsedSec.toFixed(1)),
-    metric("s"),
-  ])
-
-const finalPrimaryLines = (final: FinalThroughput, width: number): UsageLine[] => {
-  const lines = [finalHeadline(final), finalSubline(final)]
-  // Prompt details ride a third continuation line, dropping trailing
-  // groups (model first) until it fits.
-  const remaining = [...finalPromptGroups(final)]
-  while (remaining.length > 0) {
-    const extra = continuation(joinGroups(remaining))
-    if (lineText(extra).length <= width) return [...lines, extra]
-    remaining.pop()
-  }
-  return lines
-}
-
-/** Same metrics as primary, one per line — mirrors core's narrow layout. */
-const finalNarrowLines = (final: FinalThroughput, width: number): UsageLine[] => {
-  const lines: UsageLine[] = [
-    [doneLabel(), value(formatTokenCount(final.outputTokens)), metric(" tok")],
-    continuation([value(formatThroughputRate(final.averageRate)), metric(" tok/s avg")]),
-    continuation([metric("peak "), value(formatThroughputRate(final.peakRate)), metric(" tok/s")]),
-    continuation([value(final.elapsedSec.toFixed(1)), metric("s")]),
-  ]
-  for (const group of finalPromptGroups(final)) {
-    const extra = continuation(group)
-    if (lineText(extra).length <= width) lines.push(extra)
-  }
-  return lines
-}
-
-const finalPromptGroups = (final: FinalThroughput): UsageLine[] => {
-  const groups: UsageLine[] = []
-  if (final.prompt.inputTokens !== undefined) {
-    groups.push([metric("input "), value(formatTokenCount(final.prompt.inputTokens)), metric(" tok")])
-  }
-  if (final.prompt.cacheReadTokens !== undefined) {
-    groups.push([metric("cache read "), value(formatTokenCount(final.prompt.cacheReadTokens)), metric(" tok")])
-  }
-  if (final.prompt.cacheWriteTokens !== undefined) {
-    groups.push([metric("cache write "), value(formatTokenCount(final.prompt.cacheWriteTokens)), metric(" tok")])
-  }
-  if (final.prompt.ttftMs !== undefined) {
-    groups.push([metric("TTFT "), value(formatTtft(final.prompt.ttftMs))])
-  }
-  if (final.prompt.approximatePromptRate !== undefined) {
-    groups.push([
-      metric("approx. prompt "),
-      value(formatThroughputRate(final.prompt.approximatePromptRate)),
-      metric(" tok/s"),
-    ])
-  }
-  if (final.model) groups.push([metric(final.model)])
-  return groups
-}
-
-const joinGroups = (groups: ReadonlyArray<UsageLine>): UsageLine =>
-  groups.flatMap((group, index) => (index === 0 ? group : [separator(), ...group]))
+/** Tokens-only fallback for very narrow terminals. */
+const finalTokensLine = (final: FinalThroughput): UsageLine => [
+  doneLabel(),
+  value(formatTokenCount(final.outputTokens)),
+  metric(" tok"),
+]
 
 /**
- * Format the throughput snapshot as styled footer lines. The layout mirrors
- * the MAIN/TOT sections: primary lines first, falling back to a narrow
- * one-metric-per-line layout when any primary row exceeds the width.
+ * Format the throughput snapshot as a single friendly footer line: live
+ * rate + tokens while streaming, tokens + average rate when done. On very
+ * narrow terminals the secondary metric is dropped, keeping the headline
+ * number (rate while live, tokens when done).
  */
 export function formatThroughputLines(
   state: ThroughputState | undefined,
@@ -391,13 +220,14 @@ export function formatThroughputLines(
   const normalizedWidth = Math.max(1, Math.floor(width))
   if (state === undefined) return []
   if (state.kind === "streaming") {
-    const primary = livePrimaryLines(state, now)
-    if (primary.every(line => lineText(line).length <= normalizedWidth)) return primary
-    return liveNarrowLines(state, now)
+    if (state.measurementStartTime === undefined) return [livePendingLine(state)]
+    const full = liveFullLine(state, now)
+    if (lineText(full).length <= normalizedWidth) return [full]
+    return [liveRateLine(state, now)]
   }
-  const primary = finalPrimaryLines(state, normalizedWidth)
-  if (primary.every(line => lineText(line).length <= normalizedWidth)) return primary
-  return finalNarrowLines(state, normalizedWidth)
+  const full = finalFullLine(state)
+  if (lineText(full).length <= normalizedWidth) return [full]
+  return [finalTokensLine(state)]
 }
 
 /** Join formatted throughput lines for change detection. */
