@@ -7,7 +7,11 @@ longer load.
 
 The footer renders `MAIN` / `TOT` usage lines (input/out/cache/think/write,
 request and agent counts, cache hit-rate, cost) for the current session and
-its whole session family. Refreshes are event-driven (`session.usage.updated`,
+its whole session family. A live throughput line is prepended while an
+assistant response streams (rolling `est.` tok/s, average tok/s, estimated
+output tokens, elapsed time), replaced by a final `✓` summary with
+provider-reported totals when the step ends. Refreshes are event-driven
+(`session.usage.updated`,
 execution start/finish, session viewed/created, server connect — debounced
 at 400ms). Tab switches emit no server event, so a reactive route watcher
 refreshes instantly when the host notifies, backed by a 1s router poll that
@@ -25,7 +29,37 @@ Tested against OpenCode `v2.0.11` (`@opencode/plugin@2.0.11`).
   src/tui.tsx    # V2 CLI entry (id "token-tracker.tui"): event subscriptions,
                  # refresh loop, and static sidebar.footer slot content
   src/core.ts    # usage aggregation / formatting (no plugin entrypoint)
+  src/throughput.ts  # live/final tok/s tracking + formatting (no entrypoint)
 ```
+
+## Live throughput
+
+Design reference: `npm:pi-live-throughput` as used in the Pi coding agent.
+While a response streams, the footer prepends a single live line:
+
+```text
+⚡ est. 92.3 tok/s · avg 84.5 tok/s · ~1.2k tok · 14.2s · gpt-5-mini
+```
+
+When the step ends it is replaced by a final summary that persists until
+the next response starts:
+
+```text
+✓ 512 tok in 4.2s · 120 tok/s avg · peak 319 tok/s
+  input 1.2k tok · cache read 8.0k tok · TTFT 800ms · approx. prompt 1500 tok/s
+```
+
+Adaptations for OpenCode: provider token counts are exposed only at step
+boundaries (`session.step.ended`), never during the stream, so all live
+figures are chars/4 heuristic estimates over text, reasoning, and
+tool-input deltas (labeled `est.` / `~`); the final summary always uses
+provider-reported step tokens. TTFT runs from `session.execution.started`
+(fallback: `session.step.started`) to the first delta, and rate measurement
+starts only after a second output token so TTFT never dilutes the rolling
+(3s window), average, or peak rates. Live updates are delta-driven at up to
+4Hz plus a 1Hz tick refresh, perform no server sync, and reuse the static
+slot re-registration path; over-wide rows fall back to compact or
+continuation layouts instead of wrapping.
 
 Only `src/index.ts` and `src/tui.tsx` are package entries, so `src/core.ts`
 is never probed as a plugin — this is what caused the old

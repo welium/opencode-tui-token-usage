@@ -3,14 +3,28 @@
  *
  * Displays recorded token usage for the current session and all descendants.
  *
+ * A live throughput line (design reference: `npm:pi-live-throughput` as used
+ * in the Pi agent) is prepended while an assistant response streams: rolling
+ * `est.` tok/s over a 3s window, average tok/s, estimated output tokens
+ * (`~`, chars/4 heuristic), and elapsed time. Measurement starts only after
+ * a second output token so TTFT never dilutes the rates. When streaming
+ * finishes, a final `✓` summary with provider-reported step tokens (avg/peak
+ * rate, input/cache/TTFT prompt metrics) persists until the next response.
+ * OpenCode exposes provider token counts only at step boundaries, never
+ * during the stream, so all live figures are estimates; the final summary
+ * always uses provider-reported totals.
+ *
  * Update model: refreshes are driven by server events
- * (`session.usage.updated`, execution start/finish) with a debounced
- * re-sync, plus a slow fallback poll for session switches and missed
- * events. Each refresh with changed totals re-registers the slot claim
- * with fully static content: the render closes over plain values and uses
- * no signals, effects, or conditional helpers, because signal updates do
- * not propagate into slot JSX from an installed package while fresh
- * mounts render reliably.
+ * (`session.usage.updated`, execution start/finish, session viewed/created,
+ * server connect — debounced at 400ms) with live delta events
+ * (`session.text.delta`, `session.reasoning.delta`,
+ * `session.tool.input.delta` — throttled at 250ms, no server sync) plus a
+ * slow fallback poll for session switches and missed events. Each refresh
+ * with changed content re-registers the slot claim with fully static
+ * content: the render closes over plain values and uses no signals,
+ * effects, or conditional helpers, because signal updates do not propagate
+ * into slot JSX from an installed package while fresh mounts render
+ * reliably.
  */
 
 /** @jsxImportSource @opentui/solid */
@@ -24,10 +38,21 @@ import {
   type UsageLine,
   type UsageSegmentTone,
 } from "./core"
+import {
+  createStreamingThroughput,
+  finalizeThroughput,
+  finalizeThroughputEstimate,
+  formatThroughputLines,
+  recordThroughputDelta,
+  type StreamingThroughput,
+  type ThroughputState,
+} from "./throughput"
 
 const DEBOUNCE_MS = 400
 const ROUTER_POLL_MS = 1_000
 const QUIET_REFRESH_MS = 5_000
+const LIVE_THROTTLE_MS = 250
+const THROUGHPUT_STORE_LIMIT = 100
 
 export default Plugin.define({
   id: "token-tracker.tui",
@@ -39,8 +64,12 @@ export default Plugin.define({
     let debounceTimer: ReturnType<typeof setTimeout> | undefined
     let lastSessionID: string | undefined
     let lastUsage: SessionTreeUsage | undefined
-    let lastKey = ""
+    let lastFooterKey = ""
     let lastRefreshAt = 0
+    let lastLivePublishAt = 0
+    let liveTimer: ReturnType<typeof setTimeout> | undefined
+    const throughputBySession = new Map<string, ThroughputState>()
+    const requestTimeBySession = new Map<string, number>()
     const unsubscribers: (() => void)[] = []
 
     const segmentColor = (tone: UsageSegmentTone) => {
@@ -87,6 +116,141 @@ export default Plugin.define({
       } catch {
         return true
       }
+    }
+
+    const cachedModel = (sessionID: string): string => {
+      try {
+        return context.data.session.get(sessionID)?.model?.id ?? ""
+      } catch {
+        return ""
+      }
+    }
+
+    const rememberBounded = <Value,>(store: Map<string, Value>, key: string, val: Value): void => {
+      if (!store.has(key)) {
+        while (store.size >= THROUGHPUT_STORE_LIMIT) {
+          const oldest = store.keys().next()
+          if (oldest.done) break
+          store.delete(oldest.value)
+        }
+      }
+      store.set(key, val)
+    }
+
+    const ensureStreaming = (sessionID: string, now: number, model?: string): StreamingThroughput => {
+      const existing = throughputBySession.get(sessionID)
+      if (existing !== undefined && existing.kind === "streaming") {
+        if (!existing.model && model) existing.model = model
+        return existing
+      }
+      const stream = createStreamingThroughput(
+        now,
+        requestTimeBySession.get(sessionID),
+        model ?? cachedModel(sessionID),
+      )
+      rememberBounded(throughputBySession, sessionID, stream)
+      return stream
+    }
+
+    /** Throughput snapshot for the visible session: live first, else own final. */
+    const displayedThroughput = (): ThroughputState | undefined => {
+      const current = currentSessionID()
+      if (current === undefined) return undefined
+      const own = throughputBySession.get(current)
+      if (own !== undefined && own.kind === "streaming") return own
+      try {
+        for (const memberID of context.data.session.family(current)) {
+          const member = throughputBySession.get(memberID)
+          if (member !== undefined && member.kind === "streaming") return member
+        }
+      } catch {
+        // Family lookup failed: fall through to the session's own snapshot.
+      }
+      return own
+    }
+
+    const footerLinesKey = (ownerSessionID: string, lines: readonly UsageLine[]): string =>
+      `${ownerSessionID}:${lastUsage === undefined ? "pending" : JSON.stringify(lastUsage.tree)}:${lines.map(line => line.map(segment => segment.text).join("")).join("\n")}`
+
+    const renderFooter = (ownerSessionID: string): void => {
+      if (disposed || currentSessionID() !== ownerSessionID) return
+      const now = Date.now()
+      const width = context.renderer.width
+      const throughputLines = formatThroughputLines(displayedThroughput(), width, now)
+      const usageLines = lastUsage === undefined ? [placeholder] : formatUsageSegments(lastUsage, width)
+      const lines = [...throughputLines, ...usageLines]
+      const key = footerLinesKey(ownerSessionID, lines)
+      if (key === lastFooterKey) return
+      lastFooterKey = key
+      publish(lines)
+    }
+
+    const publishLive = (sessionID: string, force: boolean): void => {
+      if (disposed) return
+      const current = currentSessionID()
+      if (current === undefined) return
+      if (sessionID !== current) {
+        try {
+          if (!context.data.session.family(current).includes(sessionID)) return
+        } catch {
+          // Family lookup failed: still refresh the visible footer.
+        }
+      }
+      const now = Date.now()
+      if (!force && now - lastLivePublishAt < LIVE_THROTTLE_MS) {
+        if (liveTimer === undefined) {
+          liveTimer = setTimeout(
+            () => {
+              liveTimer = undefined
+              if (!disposed) {
+                const visible = currentSessionID()
+                if (visible !== undefined) renderFooter(visible)
+              }
+            },
+            LIVE_THROTTLE_MS - (now - lastLivePublishAt),
+          )
+        }
+        return
+      }
+      lastLivePublishAt = now
+      renderFooter(current)
+    }
+
+    const deltaText = (data: unknown): string => {
+      if (typeof data !== "object" || data === null) return ""
+      const record = data as { delta?: unknown; text?: unknown }
+      if (typeof record.delta === "string") return record.delta
+      if (typeof record.text === "string") return record.text
+      return ""
+    }
+
+    const handleThroughputDelta = (sessionID: string, chars: number): void => {
+      if (disposed || chars <= 0) return
+      const now = Date.now()
+      const started = recordThroughputDelta(ensureStreaming(sessionID, now), chars, now)
+      publishLive(sessionID, started)
+    }
+
+    const finiteOrZero = (value: unknown): number =>
+      typeof value === "number" && Number.isFinite(value) ? value : 0
+
+    const finalizeStreaming = (
+      sessionID: string,
+      providerTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number },
+    ): void => {
+      const stream = throughputBySession.get(sessionID)
+      if (stream === undefined || stream.kind !== "streaming") return
+      const now = Date.now()
+      const model = stream.model || cachedModel(sessionID)
+      rememberBounded(
+        throughputBySession,
+        sessionID,
+        providerTokens === undefined
+          ? finalizeThroughputEstimate(stream, now)
+          : finalizeThroughput(stream, providerTokens, now, model),
+      )
+      requestTimeBySession.delete(sessionID)
+      publishLive(sessionID, true)
     }
 
     const refresh = async (sessionID: string): Promise<void> => {
@@ -145,10 +309,7 @@ export default Plugin.define({
         if (currentSessionID() !== sessionID) return
         lastSessionID = sessionID
         lastUsage = usage
-        const key = `${sessionID}:${JSON.stringify(usage.tree)}`
-        if (key === lastKey) return
-        lastKey = key
-        publish(formatUsageSegments(usage, context.renderer.width))
+        renderFooter(sessionID)
       } catch {
         // Keep the last published snapshot on transient failures.
       } finally {
@@ -191,15 +352,80 @@ export default Plugin.define({
 
     unsubscribers.push(
       context.data.on("session.usage.updated", event => onFamilyEvent(event.data.sessionID)),
-      context.data.on("session.execution.started", event => onFamilyEvent(event.data.sessionID)),
-      context.data.on("session.execution.succeeded", event => onFamilyEvent(event.data.sessionID)),
-      context.data.on("session.execution.failed", event => onFamilyEvent(event.data.sessionID)),
-      context.data.on("session.execution.interrupted", event => onFamilyEvent(event.data.sessionID)),
+      context.data.on("session.execution.started", event => {
+        rememberBounded(requestTimeBySession, event.data.sessionID, Date.now())
+        onFamilyEvent(event.data.sessionID)
+      }),
+      context.data.on("session.execution.succeeded", event => {
+        finalizeStreaming(event.data.sessionID)
+        onFamilyEvent(event.data.sessionID)
+      }),
+      context.data.on("session.execution.failed", event => {
+        finalizeStreaming(event.data.sessionID)
+        onFamilyEvent(event.data.sessionID)
+      }),
+      context.data.on("session.execution.interrupted", event => {
+        finalizeStreaming(event.data.sessionID)
+        onFamilyEvent(event.data.sessionID)
+      }),
+      context.data.on("session.step.started", event => {
+        const sessionID = event.data.sessionID
+        if (requestTimeBySession.get(sessionID) === undefined) {
+          rememberBounded(requestTimeBySession, sessionID, Date.now())
+        }
+        const model = event.data.model
+        ensureStreaming(sessionID, Date.now(), typeof model?.id === "string" ? model.id : cachedModel(sessionID))
+        publishLive(sessionID, true)
+      }),
+      context.data.on("session.text.started", event => {
+        ensureStreaming(event.data.sessionID, Date.now())
+      }),
+      context.data.on("session.reasoning.started", event => {
+        ensureStreaming(event.data.sessionID, Date.now())
+      }),
+      context.data.on("session.tool.input.started", event => {
+        ensureStreaming(event.data.sessionID, Date.now())
+      }),
+      context.data.on("session.text.delta", event => {
+        handleThroughputDelta(event.data.sessionID, deltaText(event.data).length)
+      }),
+      context.data.on("session.reasoning.delta", event => {
+        handleThroughputDelta(event.data.sessionID, deltaText(event.data).length)
+      }),
+      context.data.on("session.tool.input.delta", event => {
+        handleThroughputDelta(event.data.sessionID, deltaText(event.data).length)
+      }),
+      context.data.on("session.step.ended", event => {
+        const tokens = event.data.tokens
+        finalizeStreaming(event.data.sessionID, {
+          input: finiteOrZero(tokens.input),
+          output: finiteOrZero(tokens.output),
+          cacheRead: finiteOrZero(tokens.cache.read),
+          cacheWrite: finiteOrZero(tokens.cache.write),
+        })
+        onFamilyEvent(event.data.sessionID)
+      }),
+      context.data.on("session.step.failed", event => {
+        const tokens = event.data.tokens
+        finalizeStreaming(
+          event.data.sessionID,
+          tokens === undefined
+            ? undefined
+            : {
+                input: finiteOrZero(tokens.input),
+                output: finiteOrZero(tokens.output),
+                cacheRead: finiteOrZero(tokens.cache.read),
+                cacheWrite: finiteOrZero(tokens.cache.write),
+              },
+        )
+        onFamilyEvent(event.data.sessionID)
+      }),
       // Opened or viewed sessions refresh directly: at event time the
       // router may not have caught up yet, so bypass the current-session gate.
       // (Publish still drops the result if another session is current then.)
       context.data.on("session.viewed", event => scheduleRefresh(event.data.sessionID)),
       context.data.on("session.created", event => scheduleRefresh(event.data.sessionID)),
+      context.data.on("tui.session.select", () => tick()),
       context.data.on("server.connected", () => tick()),
     )
 
@@ -213,6 +439,13 @@ export default Plugin.define({
       if (sessionID !== lastSessionID || lastUsage === undefined) {
         scheduleRefresh(sessionID)
         return
+      }
+      // Keep live rates fresh (rolling-window decay, elapsed time) even
+      // without delta traffic. renderFooter no-ops when nothing changed.
+      const visible = displayedThroughput()
+      if (visible !== undefined && visible.kind === "streaming") {
+        lastLivePublishAt = Date.now()
+        renderFooter(sessionID)
       }
       if (treeIsBusy(lastUsage) && Date.now() - lastRefreshAt > QUIET_REFRESH_MS) {
         scheduleRefresh(sessionID)
@@ -241,6 +474,7 @@ export default Plugin.define({
     return () => {
       disposed = true
       clearInterval(timer)
+      if (liveTimer !== undefined) clearTimeout(liveTimer)
       disposeRouteWatcher()
       if (debounceTimer !== undefined) clearTimeout(debounceTimer)
       for (const unsubscribe of unsubscribers) {
